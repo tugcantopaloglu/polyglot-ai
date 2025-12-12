@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  polyglot-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    container_name: polyglot-server
+    restart: unless-stopped
+    ports:
+      - "4433:4433/udp"
+    volumes:
+      # Persistent data storage
+      - polyglot-data:/app/data
+      # Certificates (mount your generated certs here)
+      - ./certs:/app/certs:ro
+      # Configuration
+      - ./config/server.toml:/app/config/server.toml:ro
+    environment:
+      # API keys for AI tools (set these in your environment or .env file)
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "polyglot-server", "usage"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - polyglot-network
+    # Graceful shutdown settings
+    stop_grace_period: 30s
+    # Rolling update configuration (for Docker Swarm)
+    deploy:
+      mode: replicated
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      rollback_config:
+        parallelism: 1
+        delay: 10s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+
+  # Optional: Client for testing
+  polyglot-client:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.client
+    container_name: polyglot-client
+    profiles:
+      - client
+    volumes:
+      # Certificates
+      - ./certs:/app/certs:ro
+      # Configuration
+      - ./config/client.toml:/app/config/client.toml:ro
+      # Workspace for file sync
+      - ./workspace:/app/workspace
+    environment:
+      - POLYGLOT_SERVER=polyglot-server:4433
+    depends_on:
+      - polyglot-server
+    networks:
+      - polyglot-network
+    stdin_open: true
+    tty: true
+
+volumes:
+  polyglot-data:
+    driver: local
+
+networks:
+  polyglot-network:
+    driver: bridge

@@ -1,0 +1,73 @@
+# Polyglot-AI Client Dockerfile
+# Multi-stage build for minimal image size
+
+# Build stage
+FROM rust:1.75-bookworm AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy manifests first for caching (lockfile generated in-build)
+COPY Cargo.toml ./
+COPY crates/common/Cargo.toml crates/common/
+COPY crates/server/Cargo.toml crates/server/
+COPY crates/client/Cargo.toml crates/client/
+
+# Generate lockfile for reproducible builds
+RUN cargo generate-lockfile
+
+# Create dummy source files for dependency caching
+RUN mkdir -p crates/common/src crates/server/src crates/client/src && \
+    echo "pub fn dummy() {}" > crates/common/src/lib.rs && \
+    echo "fn main() {}" > crates/server/src/main.rs && \
+    echo "fn main() {}" > crates/client/src/main.rs
+
+# Build dependencies only
+RUN cargo build --release --locked --package polyglot-client && \
+    rm -rf crates/*/src
+
+# Copy actual source code
+COPY crates/common/src crates/common/src
+COPY crates/client/src crates/client/src
+
+# Build the actual application
+RUN touch crates/common/src/lib.rs crates/client/src/main.rs && \
+    cargo build --release --locked --package polyglot-client
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -s /bin/bash polyglot
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/polyglot /usr/local/bin/
+
+# Create necessary directories
+RUN mkdir -p /app/certs /app/config /app/workspace && \
+    chown -R polyglot:polyglot /app
+
+# Copy default configuration
+COPY config/client.example.toml /app/config/client.toml
+
+# Switch to non-root user
+USER polyglot
+
+# Set working directory for workspace
+WORKDIR /app/workspace
+
+# Default command
+ENTRYPOINT ["polyglot"]
+CMD ["connect", "-c", "/app/config/client.toml"]

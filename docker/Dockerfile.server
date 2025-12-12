@@ -1,0 +1,93 @@
+# Polyglot-AI Server Dockerfile
+# Multi-stage build for minimal image size
+
+# Build stage
+FROM rust:1.75-bookworm AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy manifests first for caching (lockfile generated in-build)
+COPY Cargo.toml ./
+COPY crates/common/Cargo.toml crates/common/
+COPY crates/server/Cargo.toml crates/server/
+COPY crates/client/Cargo.toml crates/client/
+
+# Generate lockfile for reproducible builds
+RUN cargo generate-lockfile
+
+# Create dummy source files for dependency caching
+RUN mkdir -p crates/common/src crates/server/src crates/client/src && \
+    echo "pub fn dummy() {}" > crates/common/src/lib.rs && \
+    echo "fn main() {}" > crates/server/src/main.rs && \
+    echo "fn main() {}" > crates/client/src/main.rs
+
+# Build dependencies only
+RUN cargo build --release --locked --package polyglot-server && \
+    rm -rf crates/*/src
+
+# Copy actual source code
+COPY crates/common/src crates/common/src
+COPY crates/server/src crates/server/src
+
+# Build the actual application
+RUN touch crates/common/src/lib.rs crates/server/src/main.rs && \
+    cargo build --release --locked --package polyglot-server
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+# Install runtime dependencies and AI CLI tools
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js for AI CLI tools
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | \
+    gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | \
+    tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+    apt-get update && \
+    apt-get install -y gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN useradd -m -s /bin/bash polyglot
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/polyglot-server /usr/local/bin/
+
+# Create necessary directories
+RUN mkdir -p /app/data /app/certs /app/config && \
+    chown -R polyglot:polyglot /app
+
+# Copy default configuration
+COPY config/server.example.toml /app/config/server.toml
+
+# Switch to non-root user
+USER polyglot
+
+# Expose QUIC port
+EXPOSE 4433/udp
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD polyglot-server usage || exit 1
+
+# Default command
+ENTRYPOINT ["polyglot-server"]
+CMD ["start", "-c", "/app/config/server.toml"]

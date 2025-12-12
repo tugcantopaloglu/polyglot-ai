@@ -1,0 +1,44 @@
+# Polyglot-AI Client Configuration
+
+[connection]
+# Server address
+server_address = "localhost:4433"
+# Path to client certificate
+cert_path = "./certs/client.crt"
+# Path to client private key
+key_path = "./certs/client.key"
+# Path to CA certificate
+ca_path = "./certs/ca.crt"
+# Connection timeout in seconds
+timeout = 30
+# Auto-reconnect on disconnect
+auto_reconnect = true
+
+[sync]
+# Default sync mode: "on_demand" or "realtime"
+default_mode = "on_demand"
+# Paths to sync (relative to current directory)
+sync_paths = ["."]
+# Patterns to ignore during sync
+ignore_patterns = [
+    ".git",
+    "node_modules",
+    "target",
+    ".env",
+    "*.pyc",
+    "__pycache__",
+    ".DS_Store",
+    "Thumbs.db"
+]
+# Debounce interval in milliseconds for realtime sync
+debounce_ms = 500
+
+[ui]
+# Enable TUI mode
+tui_enabled = true
+# Color theme
+theme = "default"
+# Show timestamps in output
+show_timestamps = true
+# Maximum output lines to keep in history
+history_size = 1000

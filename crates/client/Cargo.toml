@@ -1,0 +1,59 @@
+[package]
+name = "polyglot-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "polyglot"
+path = "src/main.rs"
+
+[dependencies]
+polyglot-common = { path = "../common" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# QUIC
+quinn = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+toml = { workspace = true }
+
+# CLI and TUI
+clap = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
+# File watching
+notify = { workspace = true }
+
+# Hashing
+xxhash-rust = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+
+# HTTP client for updates
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

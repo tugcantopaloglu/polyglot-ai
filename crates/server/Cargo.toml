@@ -1,0 +1,70 @@
+[package]
+name = "polyglot-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "polyglot-server"
+path = "src/main.rs"
+
+[dependencies]
+polyglot-common = { path = "../common" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# QUIC
+quinn = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+toml = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Database
+rusqlite = { workspace = true }
+
+# File watching
+notify = { workspace = true }
+
+# Crypto
+ring = { workspace = true }
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+directories = { workspace = true }
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+portable-pty = { workspace = true }
+xxhash-rust = { workspace = true }
+rand = "0.9"
+
+# HTTP client for update checking
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Unix signal handling
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }

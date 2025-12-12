@@ -1,0 +1,89 @@
+# Polyglot-AI Server Configuration
+
+[server]
+# Address to bind to
+bind_address = "0.0.0.0:4433"
+# Maximum concurrent connections
+max_connections = 100
+# Idle timeout in seconds
+idle_timeout = 300
+# Enable verbose logging
+verbose = false
+
+[auth]
+# Authentication mode: "single_user" or "multi_user"
+mode = "single_user"
+# Path to server certificate
+cert_path = "./certs/server.crt"
+# Path to server private key
+key_path = "./certs/server.key"
+# Path to CA certificate for client verification
+ca_path = "./certs/ca.crt"
+# Session expiry in hours
+session_expiry_hours = 24
+
+[tools]
+# Tool rotation strategy: "on_limit", "round_robin", or "priority"
+rotation_strategy = "on_limit"
+# Default tool to use
+default_tool = "claude"
+# Seconds to wait before auto-switching tools
+switch_delay = 3
+
+[tools.claude]
+enabled = true
+path = "claude"
+priority = 1
+args = []
+env = []
+
+[tools.gemini]
+enabled = true
+path = "gemini"
+priority = 2
+args = []
+env = []
+
+[tools.codex]
+enabled = true
+path = "codex"
+priority = 3
+args = []
+env = []
+
+[tools.copilot]
+enabled = true
+path = "gh"
+priority = 4
+args = ["copilot"]
+env = []
+
+[tools.perplexity]
+enabled = true
+path = "pplx"
+priority = 5
+args = []
+env = []
+
+[tools.cursor]
+enabled = true
+path = "cursor-agent"
+priority = 6
+args = []
+env = []
+
+[tools.ollama]
+enabled = true
+path = "ollama"
+priority = 7
+# Model specified in args: ["run", "<model>"]
+args = ["run", "codellama"]
+env = []
+
+[storage]
+# Path to SQLite database
+db_path = "./data/polyglot.db"
+# Path to encrypted API keys file
+api_keys_path = "./data/keys.enc"
+# Path to store synced files
+sync_dir = "./data/sync"
