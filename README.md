@@ -1,1 +1,1 @@
-# Polygot AI
+# Polyglot AI
