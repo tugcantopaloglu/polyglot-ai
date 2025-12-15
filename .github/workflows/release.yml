@@ -43,6 +43,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            VERSION="${{ github.event.inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update version in Cargo.toml
+        shell: bash
+        run: |
+          sed -i.bak 's/^version = ".*"/version = "${{ steps.version.outputs.version }}"/' Cargo.toml
+          rm -f Cargo.toml.bak
+          echo "Updated version to ${{ steps.version.outputs.version }}"
+          grep "^version" Cargo.toml
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
