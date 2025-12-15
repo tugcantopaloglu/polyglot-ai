@@ -417,13 +417,17 @@ async fn run_tui_interactive(
         use windows_sys::Win32::System::Console::{
             GetConsoleMode, SetConsoleMode, GetStdHandle,
             STD_INPUT_HANDLE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+            ENABLE_PROCESSED_INPUT,
         };
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         unsafe {
             let handle = GetStdHandle(STD_INPUT_HANDLE);
-            let mut mode: u32 = 0;
-            if GetConsoleMode(handle, &mut mode) != 0 {
-                mode &= !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
-                SetConsoleMode(handle, mode);
+            if handle != INVALID_HANDLE_VALUE as _ && !handle.is_null() {
+                let mut mode: u32 = 0;
+                if GetConsoleMode(handle, &mut mode) != 0 {
+                    mode &= !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+                    let _ = SetConsoleMode(handle, mode);
+                }
             }
         }
     }
@@ -455,6 +459,9 @@ async fn run_tui_interactive(
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
                     if event::poll(Duration::from_millis(0))? {
                         if let Event::Key(key) = event::read()? {
+                            if key.kind != event::KeyEventKind::Press {
+                                continue;
+                            }
                             if let Some(action) = app.handle_key(key.code, key.modifiers) {
                                 match action {
                                     AppAction::Quit => break,
@@ -959,7 +966,7 @@ async fn check_for_updates_github(binary_name: &str) -> Result<polyglot_common::
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let url = "https://api.github.com/repos/tugcantopaloglu/selfhosted-ai-code-platform/releases/latest";
+    let url = "https://api.github.com/repos/tugcantopaloglu/polyglot-ai/releases/latest";
 
     let response = client.get(url).send().await?;
 

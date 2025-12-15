@@ -1054,7 +1054,7 @@ async fn check_for_updates_github(binary_name: &str) -> Result<polyglot_common::
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let url = "https://api.github.com/repos/tugcantopaloglu/selfhosted-ai-code-platform/releases/latest";
+    let url = "https://api.github.com/repos/tugcantopaloglu/polyglot-ai/releases/latest";
 
     let response = client.get(url).send().await?;
 

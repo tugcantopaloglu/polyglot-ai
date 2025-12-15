@@ -3,11 +3,11 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.4"
 edition = "2021"
 authors = ["Tugcan Topaloglu"]
 license = "MIT"
-repository = "https://github.com/tugcantopaloglu/selfhosted-ai-code-platform"
+repository = "https://github.com/tugcantopaloglu/polyglot-ai"
 
 [workspace.dependencies]
 # Async runtime

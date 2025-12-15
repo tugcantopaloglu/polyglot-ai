@@ -1,4 +1,4 @@
-# Polyglot-AI - multiLLM "vibing" platform
+﻿# Polyglot-AI - multiLLM "vibing" platform
 
 Is developers done? or we are not coding anymore? Who cares. Vibe coding, hard coding (idk what that means but ok) or something else. As a developer and system engineer I always like to use new tools and experiences. So on every one or two weeks I am seeing a new model or new provider making better than previous ones. So i thought it's time to create a multi-platform fast adaptable AI coding tool. First I thought about VSCode extension but I don't like extensions or trust them. So for now this is the beautiful (arguably) solution with TUI. If you don't want to use any cloud LLM for now you can add your models with ollama. Soon I will be adding my solution to implement these local modals.
 
@@ -56,14 +56,14 @@ Both modes share the same features: automatic tool rotation on rate limits, unif
 
 ```
 polyglot-ai/
-├── crates/
-│   ├── common/     # Shared types, protocol definitions, utilities
-│   ├── local/      # Standalone local binary (polyglot-local)
-│   ├── client/     # Client binary for server mode (polyglot)
-│   └── server/     # Server binary (polyglot-server)
-├── config/         # Example configuration files
-├── docker/         # Dockerfiles for containerized deployment
-└── scripts/        # Installation and setup scripts
+â”œâ”€â”€ crates/
+â”‚   â”œâ”€â”€ common/     # Shared types, protocol definitions, utilities
+â”‚   â”œâ”€â”€ local/      # Standalone local binary (polyglot-local)
+â”‚   â”œâ”€â”€ client/     # Client binary for server mode (polyglot)
+â”‚   â””â”€â”€ server/     # Server binary (polyglot-server)
+â”œâ”€â”€ config/         # Example configuration files
+â”œâ”€â”€ docker/         # Dockerfiles for containerized deployment
+â””â”€â”€ scripts/        # Installation and setup scripts
 ```
 
 Communication between client and server uses QUIC (UDP-based) with MessagePack serialization for efficiency.
@@ -95,13 +95,37 @@ cargo build --release
 
 Download pre-built binaries from the [Releases](https://github.com/tugcantopaloglu/polyglot-ai/releases) page.
 
+**Windows one-line install/update**
+
+PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/tugcantopaloglu/polyglot-ai/main/scripts/install.ps1 | iex
+```
+
+cmd.exe:
+
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/tugcantopaloglu/polyglot-ai/main/scripts/install.ps1 -UseBasicParsing | iex"
+```
+
+Set `POLYGLOT_WITH_TOOLS=1` to also install AI CLI tools. Add `POLYGLOT_FORCE=1` (or `-Force`) to re-download even if the target version is already installed.
+
+**Linux/macOS one-line install/update**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tugcantopaloglu/polyglot-ai/main/scripts/install.sh | bash
+```
+
+Set `POLYGLOT_WITH_TOOLS=1` to also install AI CLI tools. Add `POLYGLOT_FORCE=1` to re-download even if the target version is already installed. Override `POLYGLOT_BIN_DIR` or `POLYGLOT_INSTALL_DIR` to change destinations.
+
 Available binaries:
 
-- `polyglot-local-linux-amd64`
-- `polyglot-local-linux-arm64`
-- `polyglot-local-darwin-amd64`
-- `polyglot-local-darwin-arm64`
-- `polyglot-local-windows-amd64.exe`
+- `polyglot-local-x86_64-unknown-linux-gnu`
+- `polyglot-local-aarch64-unknown-linux-gnu`
+- `polyglot-local-x86_64-apple-darwin`
+- `polyglot-local-aarch64-apple-darwin`
+- `polyglot-local-x86_64-pc-windows-msvc.exe`
 
 ### Docker
 
@@ -448,3 +472,5 @@ Tugcan Topaloglu ([@tugcantopaloglu](https://github.com/tugcantopaloglu))
 ## Contributing
 
 Issues and pull requests welcome at https://github.com/tugcantopaloglu/polyglot-ai
+
+

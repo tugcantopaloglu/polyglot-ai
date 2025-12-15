@@ -376,9 +376,7 @@ impl LocalToolManager {
         }
 
         while let Some(result) = join_set.join_next().await {
-            if let Err(e) = result {
-                tracing::error!("Multi-model task error: {:?}", e);
-            }
+            let _ = result;
         }
 
         Ok(())
