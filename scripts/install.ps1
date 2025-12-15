@@ -1,4 +1,3 @@
-﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Polyglot-AI one-line installer (Windows PowerShell)
@@ -6,18 +5,6 @@
 .DESCRIPTION
     Downloads published binaries from GitHub Releases, installs or updates them in place,
     and optionally installs AI CLI tools. No prompts; suitable for PowerShell or cmd one-liners.
-
-.PARAMETER WithTools
-    Also install AI CLI tools (Claude, Gemini, Codex, Copilot) via npm/gh.
-
-.PARAMETER InstallDir
-    Installation directory (default: $env:USERPROFILE\.polyglot-ai).
-
-.PARAMETER Version
-    Release tag to install (default: latest). Accepts values like "v0.2.0".
-
-.PARAMETER Force
-    Always download even if the target version is already installed.
 
 .EXAMPLE
     # PowerShell
@@ -28,21 +15,16 @@
 
     # Install AI tools too
     $env:POLYGLOT_WITH_TOOLS = "1"; irm https://raw.githubusercontent.com/tugcantopaloglu/polyglot-ai/main/scripts/install.ps1 | iex
+
+    # Force reinstall
+    $env:POLYGLOT_FORCE = "1"; irm https://raw.githubusercontent.com/tugcantopaloglu/polyglot-ai/main/scripts/install.ps1 | iex
 #>
 
-[CmdletBinding()]
-param(
-    [switch]$WithTools,
-    [string]$InstallDir = "$env:USERPROFILE\.polyglot-ai",
-    [string]$Version = "latest",
-    [switch]$Force
-)
-
-# Environment variable overrides
-if ($env:POLYGLOT_WITH_TOOLS -eq "1") { $WithTools = $true }
-if ($env:POLYGLOT_INSTALL_DIR) { $InstallDir = $env:POLYGLOT_INSTALL_DIR }
-if ($env:POLYGLOT_VERSION) { $Version = $env:POLYGLOT_VERSION }
-if ($env:POLYGLOT_FORCE -eq "1") { $Force = $true }
+# Configuration via environment variables (compatible with iex piping)
+$WithTools = $env:POLYGLOT_WITH_TOOLS -eq "1"
+$InstallDir = if ($env:POLYGLOT_INSTALL_DIR) { $env:POLYGLOT_INSTALL_DIR } else { "$env:USERPROFILE\.polyglot-ai" }
+$Version = if ($env:POLYGLOT_VERSION) { $env:POLYGLOT_VERSION } else { "latest" }
+$Force = $env:POLYGLOT_FORCE -eq "1"
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
