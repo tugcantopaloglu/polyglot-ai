@@ -30,7 +30,7 @@ RUN mkdir -p crates/common/src crates/server/src crates/client/src crates/local/
 RUN cargo generate-lockfile
 
 # Build dependencies only
-RUN cargo build --release --locked --package polyglot-server && \
+RUN cargo build --release --package polyglot-server && \
     rm -rf crates/*/src
 
 # Copy actual source code
@@ -39,7 +39,7 @@ COPY crates/server/src crates/server/src
 
 # Build the actual application
 RUN touch crates/common/src/lib.rs crates/server/src/main.rs && \
-    cargo build --release --locked --package polyglot-server
+    cargo build --release --package polyglot-server
 
 # Runtime stage
 FROM debian:bookworm-slim
