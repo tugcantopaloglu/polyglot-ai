@@ -100,29 +100,73 @@ function Normalize-Version {
 }
 
 function Get-TargetTriple {
-    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    # Use environment variable for reliable architecture detection on Windows
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    
+    # Fallback to RuntimeInformation if available
+    if (-not $arch) {
+        try {
+            $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        } catch {
+            $arch = "AMD64"  # Default fallback for Windows
+        }
+    }
 
-    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
-        switch ($arch) {
+    # Normalize architecture names
+    $archNormalized = switch ($arch) {
+        "AMD64" { "X64" }
+        "x64" { "X64" }
+        "X64" { "X64" }
+        "ARM64" { "Arm64" }
+        "Arm64" { "Arm64" }
+        "x86" { "X86" }
+        "X86" { "X86" }
+        default { $arch }
+    }
+
+    # Windows detection (this script is primarily for Windows)
+    # Check if running on Windows using multiple methods for compatibility
+    $isWindows = $true
+    try {
+        if ($PSVersionTable.PSVersion.Major -ge 6) {
+            $isWindows = $IsWindows
+        } elseif ($env:OS -eq "Windows_NT") {
+            $isWindows = $true
+        }
+    } catch {
+        $isWindows = ($env:OS -eq "Windows_NT")
+    }
+
+    if ($isWindows) {
+        switch ($archNormalized) {
             "X64" { return @{ triple = "x86_64-pc-windows-msvc"; ext = ".exe" } }
             "Arm64" { throw "Windows Arm64 binaries are not published yet. Please use x64." }
-            default { throw "Unsupported Windows architecture: $arch" }
+            "X86" { throw "Windows x86 (32-bit) is not supported. Please use 64-bit Windows." }
+            default { throw "Unsupported Windows architecture: $arch (normalized: $archNormalized)" }
         }
     }
 
-    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)) {
-        switch ($arch) {
-            "X64" { return @{ triple = "x86_64-unknown-linux-gnu"; ext = "" } }
-            "Arm64" { return @{ triple = "aarch64-unknown-linux-gnu"; ext = "" } }
-            default { throw "Unsupported Linux architecture: $arch" }
+    # Linux/macOS detection for cross-platform compatibility
+    try {
+        if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)) {
+            switch ($archNormalized) {
+                "X64" { return @{ triple = "x86_64-unknown-linux-gnu"; ext = "" } }
+                "Arm64" { return @{ triple = "aarch64-unknown-linux-gnu"; ext = "" } }
+                default { throw "Unsupported Linux architecture: $arch" }
+            }
         }
-    }
 
-    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) {
-        switch ($arch) {
-            "X64" { return @{ triple = "x86_64-apple-darwin"; ext = "" } }
-            "Arm64" { return @{ triple = "aarch64-apple-darwin"; ext = "" } }
-            default { throw "Unsupported macOS architecture: $arch" }
+        if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) {
+            switch ($archNormalized) {
+                "X64" { return @{ triple = "x86_64-apple-darwin"; ext = "" } }
+                "Arm64" { return @{ triple = "aarch64-apple-darwin"; ext = "" } }
+                default { throw "Unsupported macOS architecture: $arch" }
+            }
+        }
+    } catch {
+        # RuntimeInformation not available, assume Windows
+        if ($archNormalized -eq "X64") {
+            return @{ triple = "x86_64-pc-windows-msvc"; ext = ".exe" }
         }
     }
 
