@@ -13,6 +13,7 @@ use chrono::Utc;
 use polyglot_common::{Tool, ToolUsage, RotationStrategy};
 use crate::config::{LocalConfig, ToolConfig};
 use crate::environment::EnvironmentManager;
+use crate::sandbox::{SandboxConfig as SandboxSettings};
 
 #[derive(Debug, Clone)]
 pub enum ToolOutput {
@@ -38,6 +39,8 @@ struct LocalToolManagerInner {
     #[allow(dead_code)]
     default_tool: Tool,
     environment: EnvironmentManager,
+    sandbox: SandboxSettings,
+    force_isolated: bool,
 }
 
 #[derive(Clone)]
@@ -49,6 +52,39 @@ impl LocalToolManager {
     pub fn new(config: &LocalConfig) -> Self {
         let mut configs = HashMap::new();
         let mut usage = HashMap::new();
+
+        let mut sandbox_settings = SandboxSettings {
+            enabled: config.sandbox.enabled,
+            sandbox_root: config.sandbox.sandbox_root.clone(),
+            allowed_read_paths: config.sandbox.allowed_read_paths.clone(),
+            allowed_write_paths: config.sandbox.allowed_write_paths.clone(),
+            max_memory_mb: config.sandbox.max_memory_mb,
+            max_cpu_percent: config.sandbox.max_cpu_percent,
+            network_access: config.sandbox.get_network_policy(),
+            env_whitelist: config.sandbox.env_whitelist.clone(),
+        };
+
+        if let Ok(current_dir) = std::env::current_dir() {
+            if !sandbox_settings.allowed_read_paths.contains(&current_dir) {
+                sandbox_settings.allowed_read_paths.push(current_dir.clone());
+            }
+            if !sandbox_settings.allowed_write_paths.contains(&current_dir) {
+                sandbox_settings.allowed_write_paths.push(current_dir);
+            }
+        }
+
+        if sandbox_settings.allowed_read_paths.is_empty() {
+            sandbox_settings.allowed_read_paths.push(sandbox_settings.sandbox_root.clone());
+        }
+
+        if sandbox_settings.allowed_write_paths.is_empty() {
+            sandbox_settings.allowed_write_paths.push(sandbox_settings.get_workspace_dir());
+            sandbox_settings.allowed_write_paths.push(sandbox_settings.get_temp_dir());
+        }
+
+        if let Err(e) = sandbox_settings.init_directories() {
+            eprintln!("Warning: Failed to initialize sandbox directories: {}", e);
+        }
 
         let environment = EnvironmentManager::new(
             config.isolation.tools_dir.clone(),
@@ -112,6 +148,8 @@ impl LocalToolManager {
                 switch_delay: config.tools.switch_delay,
                 default_tool: config.tools.default_tool,
                 environment,
+                sandbox: sandbox_settings,
+                force_isolated: config.isolation.force_isolated,
             }),
         }
     }
@@ -122,7 +160,7 @@ impl LocalToolManager {
             None => return tool.as_str().to_string(),
         };
 
-        if config.use_isolated {
+        if self.inner.force_isolated || config.use_isolated {
             self.inner.environment.resolve_tool_path(tool, true)
         } else {
             config.path.clone()
@@ -226,17 +264,26 @@ impl LocalToolManager {
             }
         }
 
-        for (key, value) in &config.env {
+        let mut filtered_env = self.inner.sandbox.filter_env_vars(&config.env);
+        self.inner.sandbox.add_tool_env_vars(&mut filtered_env, tool);
+
+        cmd.env_clear();
+        for (key, value) in &filtered_env {
             cmd.env(key, value);
         }
 
-        if let Ok(cwd) = std::env::current_dir() {
-            cmd.current_dir(cwd);
-        }
+        let working_dir = std::env::current_dir().unwrap_or_else(|_| self.inner.sandbox.get_workspace_dir());
+        cmd.current_dir(&working_dir);
 
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.stdin(Stdio::null());
+
+        #[cfg(unix)]
+        crate::sandbox::unix::apply_resource_limits(&mut cmd, &self.inner.sandbox);
+
+        #[cfg(windows)]
+        crate::sandbox::windows::apply_resource_limits(&mut cmd, &self.inner.sandbox);
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,

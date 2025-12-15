@@ -4,6 +4,7 @@ mod tui;
 mod history;
 mod plugins;
 mod environment;
+mod sandbox;
 
 use std::path::PathBuf;
 use std::io::{self, Write};
@@ -424,7 +425,7 @@ async fn run_tui(tool_manager: LocalToolManager, _config: &LocalConfig, mut hist
 
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                    if event::poll(Duration::from_millis(0))? {
+                    while event::poll(Duration::from_millis(0))? {
                         if let Event::Key(key) = event::read()? {
                             if key.kind != event::KeyEventKind::Press {
                                 continue;

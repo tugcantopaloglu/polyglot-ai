@@ -1,9 +1,11 @@
 //! Configuration for Polyglot-AI Local
 
 use std::path::PathBuf;
+use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use polyglot_common::{Tool, RotationStrategy};
 use crate::plugins::PluginConfig;
+use crate::sandbox::NetworkPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalConfig {
@@ -15,6 +17,9 @@ pub struct LocalConfig {
 
     #[serde(default)]
     pub isolation: IsolationConfig,
+
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
@@ -66,7 +71,7 @@ pub struct ToolConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IsolationConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     #[serde(default = "default_tools_dir")]
@@ -74,20 +79,107 @@ pub struct IsolationConfig {
 
     #[serde(default)]
     pub auto_install: bool,
+
+    #[serde(default = "default_true")]
+    pub force_isolated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default = "default_sandbox_root")]
+    pub sandbox_root: PathBuf,
+
+    #[serde(default)]
+    pub allowed_read_paths: Vec<PathBuf>,
+
+    #[serde(default)]
+    pub allowed_write_paths: Vec<PathBuf>,
+
+    #[serde(default = "default_max_memory")]
+    pub max_memory_mb: Option<u64>,
+
+    #[serde(default = "default_max_cpu")]
+    pub max_cpu_percent: Option<u8>,
+
+    #[serde(default = "default_network_policy")]
+    pub network_access: String,
+
+    #[serde(default = "default_env_whitelist")]
+    pub env_whitelist: HashSet<String>,
 }
 
 fn default_tools_dir() -> std::path::PathBuf {
     directories::BaseDirs::new()
-        .map(|d| d.data_dir().join("polyglot").join("tools"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".polyglot/tools"))
+        .map(|d| d.data_dir().join("polyglot").join("sandbox").join("tools"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".polyglot/sandbox/tools"))
+}
+
+fn default_sandbox_root() -> PathBuf {
+    directories::BaseDirs::new()
+        .map(|d| d.data_dir().join("polyglot").join("sandbox"))
+        .unwrap_or_else(|| PathBuf::from(".polyglot/sandbox"))
+}
+
+fn default_max_memory() -> Option<u64> {
+    Some(4096)
+}
+
+fn default_max_cpu() -> Option<u8> {
+    Some(80)
+}
+
+fn default_network_policy() -> String {
+    "allow_all".to_string()
+}
+
+fn default_env_whitelist() -> HashSet<String> {
+    let mut set = HashSet::new();
+    set.insert("PATH".to_string());
+    set.insert("HOME".to_string());
+    set.insert("USER".to_string());
+    set.insert("LANG".to_string());
+    set.insert("LC_ALL".to_string());
+    set.insert("TERM".to_string());
+    set.insert("PWD".to_string());
+    set
 }
 
 impl Default for IsolationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             tools_dir: default_tools_dir(),
             auto_install: false,
+            force_isolated: true,
+        }
+    }
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        let sandbox_root = default_sandbox_root();
+        Self {
+            enabled: true,
+            sandbox_root: sandbox_root.clone(),
+            allowed_read_paths: vec![],
+            allowed_write_paths: vec![],
+            max_memory_mb: default_max_memory(),
+            max_cpu_percent: default_max_cpu(),
+            network_access: default_network_policy(),
+            env_whitelist: default_env_whitelist(),
+        }
+    }
+}
+
+impl SandboxConfig {
+    pub fn get_network_policy(&self) -> NetworkPolicy {
+        match self.network_access.as_str() {
+            "deny" => NetworkPolicy::Deny,
+            "localhost" => NetworkPolicy::AllowLocalhost,
+            _ => NetworkPolicy::AllowAll,
         }
     }
 }
@@ -126,6 +218,7 @@ impl Default for LocalConfig {
             tools: ToolsConfig::default(),
             ui: UiConfig::default(),
             isolation: IsolationConfig::default(),
+            sandbox: SandboxConfig::default(),
             plugins: Vec::new(),
         }
     }
@@ -142,49 +235,49 @@ impl Default for ToolsConfig {
                 path: "claude".to_string(),
                 args: vec![],
                 env: vec![],
-                use_isolated: false,
+                use_isolated: true,
             }),
             gemini: Some(ToolConfig {
                 enabled: true,
                 path: "gemini".to_string(),
                 args: vec![],
                 env: vec![],
-                use_isolated: false,
+                use_isolated: true,
             }),
             codex: Some(ToolConfig {
                 enabled: true,
                 path: "codex".to_string(),
                 args: vec![],
                 env: vec![],
-                use_isolated: false,
+                use_isolated: true,
             }),
             copilot: Some(ToolConfig {
                 enabled: true,
                 path: "gh".to_string(),
                 args: vec!["copilot".to_string()],
                 env: vec![],
-                use_isolated: false,
+                use_isolated: true,
             }),
             perplexity: Some(ToolConfig {
                 enabled: true,
                 path: "pplx".to_string(),
                 args: vec![],
                 env: vec![],
-                use_isolated: false,
+                use_isolated: true,
             }),
             cursor: Some(ToolConfig {
                 enabled: true,
                 path: "cursor-agent".to_string(),
                 args: vec![],
                 env: vec![],
-                use_isolated: false,
+                use_isolated: true,
             }),
             ollama: Some(ToolConfig {
                 enabled: true,
                 path: "ollama".to_string(),
                 args: vec![],
                 env: vec![],
-                use_isolated: false,
+                use_isolated: true,
             }),
         }
     }

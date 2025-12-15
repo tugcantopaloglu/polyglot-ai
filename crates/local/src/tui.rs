@@ -9,7 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::UnicodeWidthChar;
 
 use polyglot_common::{Tool, ToolUsage, HistoryEntry};
 
@@ -73,6 +73,7 @@ impl MultiModelState {
 pub struct App {
     pub input: String,
     pub cursor_position: usize,
+    pub cursor_display_pos: usize,
     pub output: Vec<OutputLine>,
     pub current_tool: Option<Tool>,
     pub tools: Vec<(Tool, bool)>,
@@ -139,6 +140,7 @@ impl Default for App {
         Self {
             input: String::new(),
             cursor_position: 0,
+            cursor_display_pos: 0,
             output: Vec::new(),
             current_tool: None,
             tools: Vec::new(),
@@ -158,6 +160,13 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn update_cursor_display_pos(&mut self) {
+        self.cursor_display_pos = self.input.chars()
+            .take(self.cursor_position)
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
     }
 
     pub fn add_output(&mut self, line_type: OutputType, content: String) {
@@ -215,17 +224,34 @@ impl App {
                 if self.view == View::History {
                     self.history_selected = (self.history_selected + 1).min(self.history.len().saturating_sub(1));
                 } else {
-                    self.scroll_offset = (self.scroll_offset + 10).min(self.output.len().saturating_sub(1));
+                    self.scroll_offset = self.scroll_offset.saturating_add(10);
                 }
                 None
             }
 
-            (KeyCode::Up, _) if self.view == View::History => {
-                self.history_selected = self.history_selected.saturating_sub(1);
+            (KeyCode::Up, _) => {
+                if self.view == View::History {
+                    self.history_selected = self.history_selected.saturating_sub(1);
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                }
                 None
             }
-            (KeyCode::Down, _) if self.view == View::History => {
-                self.history_selected = (self.history_selected + 1).min(self.history.len().saturating_sub(1));
+            (KeyCode::Down, _) => {
+                if self.view == View::History {
+                    self.history_selected = (self.history_selected + 1).min(self.history.len().saturating_sub(1));
+                } else {
+                    self.scroll_offset = self.scroll_offset.saturating_add(1);
+                }
+                None
+            }
+
+            (KeyCode::Home, _) if self.view != View::Chat => {
+                self.scroll_offset = 0;
+                None
+            }
+            (KeyCode::End, _) if self.view != View::Chat => {
+                self.scroll_offset = 9999;
                 None
             }
             (KeyCode::Enter, _) if self.view == View::History => {
@@ -328,6 +354,7 @@ impl App {
                     .unwrap_or(self.input.len());
                 self.input.insert(byte_pos, c);
                 self.cursor_position += 1;
+                self.update_cursor_display_pos();
                 None
             }
 
@@ -337,6 +364,7 @@ impl App {
                     if let Some((byte_pos, ch)) = self.input.char_indices().nth(self.cursor_position) {
                         self.input.drain(byte_pos..byte_pos + ch.len_utf8());
                     }
+                    self.update_cursor_display_pos();
                 }
                 None
             }
@@ -353,17 +381,28 @@ impl App {
 
             KeyCode::Left => {
                 self.cursor_position = self.cursor_position.saturating_sub(1);
+                self.update_cursor_display_pos();
                 None
             }
 
             KeyCode::Right => {
                 let char_count = self.input.chars().count();
                 self.cursor_position = (self.cursor_position + 1).min(char_count);
+                self.update_cursor_display_pos();
                 None
             }
 
-            KeyCode::Home => { self.cursor_position = 0; None }
-            KeyCode::End => { self.cursor_position = self.input.chars().count(); None }
+            KeyCode::Home => {
+                self.cursor_position = 0;
+                self.update_cursor_display_pos();
+                None
+            }
+
+            KeyCode::End => {
+                self.cursor_position = self.input.chars().count();
+                self.update_cursor_display_pos();
+                None
+            }
 
             _ => None,
         }
@@ -500,9 +539,9 @@ pub fn draw_ui(f: &mut Frame, app: &App) {
         View::Tools => draw_tools_view(f, chunks[1], app),
         View::Usage => draw_usage_view(f, chunks[1], app),
         View::History => draw_history_view(f, chunks[1], app),
-        View::Help => draw_help_view(f, chunks[1]),
+        View::Help => draw_help_view(f, chunks[1], app),
         View::MultiSelect => draw_multi_select_view(f, chunks[1], app),
-        View::About => draw_about_view(f, chunks[1]),
+        View::About => draw_about_view(f, chunks[1], app),
     }
 
     if app.view == View::Chat || app.view == View::MultiSelect {
@@ -579,56 +618,232 @@ fn draw_chat_view(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_tools_view(f: &mut Frame, area: Rect, app: &App) {
-    let items: Vec<ListItem> = app.tools
-        .iter()
-        .map(|(tool, available)| {
-            let status = if *available { "[OK]" } else { "[--]" };
-            let current = if Some(*tool) == app.current_tool { " (current)" } else { "" };
-            let style = if *available {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default().fg(Color::Red)
-            };
+    let mut text: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Available AI Tools:",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
 
-            ListItem::new(Line::from(vec![
-                Span::styled(status, style),
-                Span::raw(" "),
-                Span::styled(tool.display_name(), Style::default().fg(Color::White)),
-                Span::styled(current, Style::default().fg(Color::Yellow)),
-            ]))
-        })
-        .collect();
+    for (tool, available) in &app.tools {
+        let status = if *available { "✓" } else { "✗" };
+        let current = if Some(*tool) == app.current_tool { " (current)" } else { "" };
+        let status_style = if *available {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        };
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Available Tools"));
-    f.render_widget(list, area);
-}
+        text.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(status, status_style),
+            Span::raw("  "),
+            Span::styled(tool.display_name(), Style::default().fg(Color::White)),
+            Span::styled(current, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+    }
 
-fn draw_usage_view(f: &mut Frame, area: Rect, app: &App) {
-    let text: Vec<Line> = app.usage
-        .iter()
-        .flat_map(|stat| {
-            vec![
-                Line::from(Span::styled(
-                    stat.tool.display_name(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(format!("  Requests:    {}", stat.requests)),
-                Line::from(format!("  Tokens:      {}", stat.tokens_used)),
-                Line::from(format!("  Errors:      {}", stat.errors)),
-                Line::from(format!("  Rate Limits: {}", stat.rate_limit_hits)),
-                Line::from(""),
-            ]
-        })
-        .collect();
+    if app.tools.is_empty() {
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            "  No tools configured.",
+            Style::default().fg(Color::Gray),
+        )));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        "─────────────────────────────────────────────────────────────────",
+        Style::default().fg(Color::DarkGray),
+    )));
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        "  Use /switch <tool> to change the current tool",
+        Style::default().fg(Color::Gray),
+    )));
 
     let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title("Usage Statistics"))
-        .wrap(Wrap { trim: true });
+        .block(Block::default().borders(Borders::ALL).title(" Available Tools [F2] "))
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll_offset as u16, 0));
     f.render_widget(paragraph, area);
 }
 
-fn draw_help_view(f: &mut Frame, area: Rect) {
+fn draw_usage_view(f: &mut Frame, area: Rect, app: &App) {
+    let mut text: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "═══════════════════════════════════════════════════════════════════",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "  Tool Usage Statistics",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "═══════════════════════════════════════════════════════════════════",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+
+    if app.usage.is_empty() {
+        text.push(Line::from(Span::styled(
+            "  No usage data yet. Start using tools to see statistics.",
+            Style::default().fg(Color::Gray),
+        )));
+    } else {
+        for stat in &app.usage {
+            let status_icon = if stat.is_available { "✓" } else { "✗" };
+            let status_color = if stat.is_available { Color::Green } else { Color::Red };
+
+            text.push(Line::from(vec![
+                Span::styled(status_icon, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(
+                    stat.tool.display_name(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    if stat.is_available { "(Available)" } else { "(Unavailable)" },
+                    Style::default().fg(status_color),
+                ),
+            ]));
+
+            let success_rate = if stat.requests > 0 {
+                let successes = stat.requests.saturating_sub(stat.errors);
+                (successes as f64 / stat.requests as f64 * 100.0) as u64
+            } else {
+                0
+            };
+
+            let avg_tokens = if stat.requests > 0 {
+                stat.tokens_used / stat.requests
+            } else {
+                0
+            };
+
+            let last_used_str = if let Some(last) = stat.last_used {
+                let duration = chrono::Utc::now().signed_duration_since(last);
+                if duration.num_days() > 0 {
+                    format!("{} days ago", duration.num_days())
+                } else if duration.num_hours() > 0 {
+                    format!("{} hours ago", duration.num_hours())
+                } else if duration.num_minutes() > 0 {
+                    format!("{} minutes ago", duration.num_minutes())
+                } else {
+                    "Just now".to_string()
+                }
+            } else {
+                "Never".to_string()
+            };
+
+            text.push(Line::from(Span::styled(
+                "  ───────────────────────────────────────────────────────────",
+                Style::default().fg(Color::DarkGray),
+            )));
+
+            text.push(Line::from(vec![
+                Span::raw("  Total Requests:      "),
+                Span::styled(format!("{}", stat.requests), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            ]));
+
+            text.push(Line::from(vec![
+                Span::raw("  Tokens Used:         "),
+                Span::styled(format_number(stat.tokens_used), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]));
+
+            text.push(Line::from(vec![
+                Span::raw("  Avg Tokens/Request:  "),
+                Span::styled(format_number(avg_tokens), Style::default().fg(Color::Cyan)),
+            ]));
+
+            let success_color = if success_rate >= 95 {
+                Color::Green
+            } else if success_rate >= 75 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+
+            text.push(Line::from(vec![
+                Span::raw("  Success Rate:        "),
+                Span::styled(format!("{}%", success_rate), Style::default().fg(success_color).add_modifier(Modifier::BOLD)),
+            ]));
+
+            text.push(Line::from(vec![
+                Span::raw("  Errors:              "),
+                Span::styled(
+                    format!("{}", stat.errors),
+                    Style::default().fg(if stat.errors > 0 { Color::Red } else { Color::Green }),
+                ),
+            ]));
+
+            text.push(Line::from(vec![
+                Span::raw("  Rate Limit Hits:     "),
+                Span::styled(
+                    format!("{}", stat.rate_limit_hits),
+                    Style::default().fg(if stat.rate_limit_hits > 0 { Color::Red } else { Color::Green }),
+                ),
+            ]));
+
+            text.push(Line::from(vec![
+                Span::raw("  Last Used:           "),
+                Span::styled(last_used_str, Style::default().fg(Color::Gray)),
+            ]));
+
+            text.push(Line::from(""));
+        }
+
+        text.push(Line::from(Span::styled(
+            "═══════════════════════════════════════════════════════════════════",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let total_requests: u64 = app.usage.iter().map(|s| s.requests).sum();
+        let total_tokens: u64 = app.usage.iter().map(|s| s.tokens_used).sum();
+        let total_errors: u64 = app.usage.iter().map(|s| s.errors).sum();
+
+        text.push(Line::from(vec![
+            Span::styled("  TOTAL", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+        text.push(Line::from(vec![
+            Span::raw("  All Requests:        "),
+            Span::styled(format!("{}", total_requests), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]));
+        text.push(Line::from(vec![
+            Span::raw("  All Tokens:          "),
+            Span::styled(format_number(total_tokens), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+        text.push(Line::from(vec![
+            Span::raw("  All Errors:          "),
+            Span::styled(
+                format!("{}", total_errors),
+                Style::default().fg(if total_errors > 0 { Color::Red } else { Color::Green }),
+            ),
+        ]));
+    }
+
+    let paragraph = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title(" Usage Statistics [F3] "))
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll_offset as u16, 0));
+    f.render_widget(paragraph, area);
+}
+
+fn format_number(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.2}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn draw_help_view(f: &mut Frame, area: Rect, app: &App) {
     let help_text = vec![
         Line::from(Span::styled("Commands:", Style::default().add_modifier(Modifier::BOLD))),
         Line::from("  /usage      - Show usage statistics"),
@@ -646,14 +861,22 @@ fn draw_help_view(f: &mut Frame, area: Rect) {
         Line::from("  /quit       - Exit"),
         Line::from(""),
         Line::from(Span::styled("Keyboard Shortcuts:", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from("  F1-F5       - Switch views (Chat, Tools, Usage, History, Help)"),
-        Line::from("  F6          - Multi-model tool selection"),
-        Line::from("  F7          - About"),
-        Line::from("  Ctrl+M      - Toggle multi-model mode"),
-        Line::from("  Ctrl+N      - New chat with context transfer"),
-        Line::from("  Ctrl+C/Q    - Quit"),
-        Line::from("  PageUp/Down - Scroll output / navigate history"),
-        Line::from("  Enter       - Send message / select history item"),
+        Line::from("  F1-F7         - Switch views (Chat, Tools, Usage, History, Help, Multi, About)"),
+        Line::from("  Ctrl+M        - Toggle multi-model mode"),
+        Line::from("  Ctrl+N        - New chat with context transfer"),
+        Line::from("  Ctrl+C/Q      - Quit"),
+        Line::from(""),
+        Line::from(Span::styled("Scrolling:", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  Up/Down       - Scroll line by line"),
+        Line::from("  PageUp/Down   - Scroll page by page (10 lines)"),
+        Line::from("  Home          - Jump to top"),
+        Line::from("  End           - Jump to bottom"),
+        Line::from(""),
+        Line::from(Span::styled("Input Editing:", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  Left/Right    - Move cursor"),
+        Line::from("  Home/End      - Jump to start/end of line"),
+        Line::from("  Backspace/Del - Delete characters"),
+        Line::from("  Enter         - Send message / select item"),
         Line::from(""),
         Line::from(Span::styled("Multi-Model Mode:", Style::default().add_modifier(Modifier::BOLD))),
         Line::from("  Query multiple AI tools simultaneously and compare responses"),
@@ -665,15 +888,18 @@ fn draw_help_view(f: &mut Frame, area: Rect) {
         Line::from("  - Direct local execution (no server needed)"),
         Line::from("  - Context transfer between chats and tools"),
         Line::from("  - Chat history: 5 recent global + all project chats"),
+        Line::from("  - Sandboxed execution for security"),
+        Line::from("  - Project directory auto-detection"),
     ];
 
     let paragraph = Paragraph::new(help_text)
-        .block(Block::default().borders(Borders::ALL).title("Help"))
-        .wrap(Wrap { trim: true });
+        .block(Block::default().borders(Borders::ALL).title(" Help [F5] "))
+        .wrap(Wrap { trim: true })
+        .scroll((app.scroll_offset as u16, 0));
     f.render_widget(paragraph, area);
 }
 
-fn draw_about_view(f: &mut Frame, area: Rect) {
+fn draw_about_view(f: &mut Frame, area: Rect, app: &App) {
     let about_text = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -758,8 +984,9 @@ fn draw_about_view(f: &mut Frame, area: Rect) {
     ];
 
     let paragraph = Paragraph::new(about_text)
-        .block(Block::default().borders(Borders::ALL).title("About"))
-        .wrap(Wrap { trim: false });
+        .block(Block::default().borders(Borders::ALL).title(" About [F7] "))
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll_offset as u16, 0));
     f.render_widget(paragraph, area);
 }
 
@@ -981,17 +1208,23 @@ fn format_time_ago(time: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App) {
+    let input_width = area.width.saturating_sub(3) as usize;
+
+    let scroll_offset = if app.cursor_display_pos >= input_width {
+        app.cursor_display_pos.saturating_sub(input_width) + 1
+    } else {
+        0
+    };
+
+    let visible_cursor_pos = app.cursor_display_pos.saturating_sub(scroll_offset);
+
     let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title("Input"));
+        .block(Block::default().borders(Borders::ALL).title("Input"))
+        .scroll((0, scroll_offset as u16));
     f.render_widget(input, area);
 
-    let cursor_display_pos: usize = app.input.chars()
-        .take(app.cursor_position)
-        .collect::<String>()
-        .width();
-
     f.set_cursor_position((
-        area.x + cursor_display_pos as u16 + 1,
+        area.x + visible_cursor_pos as u16 + 1,
         area.y + 1,
     ));
 }

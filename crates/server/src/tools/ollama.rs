@@ -38,6 +38,20 @@ impl OllamaAdapter {
             env,
         )
     }
+
+    async fn is_model_downloaded(&self) -> Result<bool, ToolError> {
+        let output = Command::new(&self.path)
+            .arg("list")
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Ok(false);
+        }
+
+        let list_output = String::from_utf8_lossy(&output.stdout);
+        Ok(list_output.lines().any(|line| line.starts_with(&self.model)))
+    }
 }
 
 #[async_trait]
@@ -62,6 +76,27 @@ impl ToolAdapter for OllamaAdapter {
         request: ToolRequest,
         output_tx: mpsc::Sender<ToolOutput>,
     ) -> Result<(), ToolError> {
+        let is_downloaded = self.is_model_downloaded().await.unwrap_or(false);
+
+        if !is_downloaded {
+            output_tx.send(ToolOutput::Stderr(format!("⚠️  Model '{}' is not downloaded.", self.model))).await.ok();
+            output_tx.send(ToolOutput::Stderr("".to_string())).await.ok();
+            output_tx.send(ToolOutput::Stderr("This will download the model, which may:".to_string())).await.ok();
+            output_tx.send(ToolOutput::Stderr("  - Take several minutes to complete".to_string())).await.ok();
+            output_tx.send(ToolOutput::Stderr("  - Use significant bandwidth".to_string())).await.ok();
+            output_tx.send(ToolOutput::Stderr("  - Require several GB of disk space".to_string())).await.ok();
+            output_tx.send(ToolOutput::Stderr("".to_string())).await.ok();
+            output_tx.send(ToolOutput::Stderr("Press Ctrl+C within 5 seconds to cancel...".to_string())).await.ok();
+
+            for i in (1..=5).rev() {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                output_tx.send(ToolOutput::Stderr(format!("Starting download in {}...", i))).await.ok();
+            }
+
+            output_tx.send(ToolOutput::Stderr("".to_string())).await.ok();
+            output_tx.send(ToolOutput::Stderr("Starting model download...".to_string())).await.ok();
+        }
+
         let mut cmd = Command::new(&self.path);
 
         cmd.arg("run");
