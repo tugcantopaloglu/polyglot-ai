@@ -34,6 +34,10 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, CryptoError> {
     if s.len() % 2 != 0 {
         return Err(CryptoError::HashError);
     }
+    
+    if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(CryptoError::HashError);
+    }
 
     (0..s.len())
         .step_by(2)

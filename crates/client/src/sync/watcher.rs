@@ -175,8 +175,7 @@ fn collect_files(
 
 fn should_ignore(path: &str, patterns: &[String]) -> bool {
     for pattern in patterns {
-        if pattern.starts_with('*') {
-            let suffix = &pattern[1..];
+        if let Some(suffix) = pattern.strip_prefix('*') {
             if path.ends_with(suffix) {
                 return true;
             }

@@ -91,13 +91,13 @@ pub fn is_rate_limit_message(output: &str) -> bool {
 pub fn parse_token_count(output: &str) -> Option<u64> {
     let lower = output.to_lowercase();
 
-    if let Some(idx) = lower.find("tokens") {
-        let after = &output[idx..];
-        if let Some(num_start) = after.find(|c: char| c.is_ascii_digit()) {
-            let num_str: String = after[num_start..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+    if let Some(tokens_part) = lower.split("tokens").nth(1) {
+        let num_str: String = tokens_part
+            .chars()
+            .skip_while(|c| !c.is_ascii_digit())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !num_str.is_empty() {
             if let Ok(count) = num_str.parse() {
                 return Some(count);
             }

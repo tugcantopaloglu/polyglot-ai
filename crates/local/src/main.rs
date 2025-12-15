@@ -209,10 +209,11 @@ async fn show_splash_screen<B: ratatui::backend::Backend>(terminal: &mut ratatui
                 .split(area);
 
             let logo_lines: Vec<Line> = logo.iter().enumerate().map(|(i, line)| {
+                let char_count = line.chars().count();
                 let visible_chars = if phase < 6 {
-                    (line.len() * (phase + 1)) / 6
+                    (char_count * (phase + 1)) / 6
                 } else {
-                    line.len()
+                    char_count
                 };
 
                 let color = if phase >= 6 {
@@ -221,8 +222,9 @@ async fn show_splash_screen<B: ratatui::backend::Backend>(terminal: &mut ratatui
                     frames[(phase + i) % frames.len()].1
                 };
 
+                let visible_str: String = line.chars().take(visible_chars).collect();
                 Line::from(Span::styled(
-                    &line[..visible_chars.min(line.len())],
+                    visible_str,
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ))
             }).collect();

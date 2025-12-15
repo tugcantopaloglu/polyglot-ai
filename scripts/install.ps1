@@ -20,7 +20,6 @@
     $env:POLYGLOT_FORCE = "1"; irm https://raw.githubusercontent.com/tugcantopaloglu/polyglot-ai/main/scripts/install.ps1 | iex
 #>
 
-# Configuration via environment variables (compatible with iex piping)
 $WithTools = $env:POLYGLOT_WITH_TOOLS -eq "1"
 $InstallDir = if ($env:POLYGLOT_INSTALL_DIR) { $env:POLYGLOT_INSTALL_DIR } else { "$env:USERPROFILE\.polyglot-ai" }
 $Version = if ($env:POLYGLOT_VERSION) { $env:POLYGLOT_VERSION } else { "latest" }
@@ -82,19 +81,16 @@ function Normalize-Version {
 }
 
 function Get-TargetTriple {
-    # Use environment variable for reliable architecture detection on Windows
     $arch = $env:PROCESSOR_ARCHITECTURE
     
-    # Fallback to RuntimeInformation if available
     if (-not $arch) {
         try {
             $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
         } catch {
-            $arch = "AMD64"  # Default fallback for Windows
+            $arch = "AMD64"
         }
     }
 
-    # Normalize architecture names
     $archNormalized = switch ($arch) {
         "AMD64" { "X64" }
         "x64" { "X64" }
@@ -106,8 +102,6 @@ function Get-TargetTriple {
         default { $arch }
     }
 
-    # Windows detection (this script is primarily for Windows)
-    # Check if running on Windows using multiple methods for compatibility
     $isWindows = $true
     try {
         if ($PSVersionTable.PSVersion.Major -ge 6) {
@@ -128,7 +122,6 @@ function Get-TargetTriple {
         }
     }
 
-    # Linux/macOS detection for cross-platform compatibility
     try {
         if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)) {
             switch ($archNormalized) {
@@ -146,7 +139,6 @@ function Get-TargetTriple {
             }
         }
     } catch {
-        # RuntimeInformation not available, assume Windows
         if ($archNormalized -eq "X64") {
             return @{ triple = "x86_64-pc-windows-msvc"; ext = ".exe" }
         }

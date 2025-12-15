@@ -1,10 +1,10 @@
 [package]
 name = "polyglot-local"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 description = "Polyglot-AI Local - Standalone AI CLI aggregator"
-license = "MIT"
-authors = ["Polyglot-AI Contributors"]
 
 [[bin]]
 name = "polyglot-local"

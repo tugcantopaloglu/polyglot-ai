@@ -204,7 +204,8 @@ impl App {
     }
 
     fn handle_command(&mut self, input: &str) -> AppAction {
-        let parts: Vec<&str> = input[1..].split_whitespace().collect();
+        let command_str = input.strip_prefix('/').unwrap_or(input);
+        let parts: Vec<&str> = command_str.split_whitespace().collect();
         match parts.first().map(|s| *s) {
             Some("usage") => {
                 self.view = View::Usage;
