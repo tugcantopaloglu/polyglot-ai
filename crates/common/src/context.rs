@@ -266,10 +266,11 @@ pub fn generate_title(content: &str) -> String {
         .collect();
 
     let title = cleaned.trim();
+    let char_count = title.chars().count();
 
-    if title.len() < 5 {
+    if char_count < 5 {
         "Chat Session".to_string()
-    } else if title.len() >= 50 {
+    } else if char_count >= 50 {
         format!("{}...", title)
     } else {
         title.to_string()
@@ -277,19 +278,28 @@ pub fn generate_title(content: &str) -> String {
 }
 
 pub fn truncate_smart(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
         return text.to_string();
     }
 
-    let truncated = &text[..max_chars];
+    let byte_pos = text.char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    
+    let truncated = &text[..byte_pos];
+    
     if let Some(pos) = truncated.rfind(|c| c == '.' || c == '!' || c == '?') {
-        if pos > max_chars / 2 {
-            return format!("{}", &text[..=pos]);
+        if pos > byte_pos / 2 && text.is_char_boundary(pos + 1) {
+            return text[..=pos].to_string();
         }
     }
 
     if let Some(pos) = truncated.rfind(char::is_whitespace) {
-        return format!("{}...", &text[..pos]);
+        if text.is_char_boundary(pos) {
+            return format!("{}...", &text[..pos]);
+        }
     }
 
     format!("{}...", truncated)
@@ -439,7 +449,16 @@ mod tests {
         let text = "This is a test sentence. And another one. Plus more.";
         let truncated = truncate_smart(text, 30);
         assert!(truncated.ends_with('.') || truncated.ends_with("..."));
-        assert!(truncated.len() <= 33);
+        assert!(truncated.chars().count() <= 33);
+    }
+
+    #[test]
+    fn test_truncate_smart_utf8() {
+        // Turkish characters are multi-byte in UTF-8
+        let text = "ğüğüüğüğüğüüğüğüiişgdg test message here";
+        let truncated = truncate_smart(text, 10);
+        // Should not panic and should truncate correctly
+        assert!(truncated.chars().count() <= 13); // 10 + "..."
     }
 
     #[test]
