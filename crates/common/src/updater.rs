@@ -111,27 +111,37 @@ pub fn version_compare(a: &str, b: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-/// Get the platform-specific asset name
+/// Get the platform-specific asset name (matches Rust target triples)
 pub fn get_platform_asset_name(binary_name: &str) -> String {
-    let os = if cfg!(target_os = "windows") {
-        "windows"
+    let target = if cfg!(target_os = "windows") {
+        if cfg!(target_arch = "x86_64") {
+            "x86_64-pc-windows-msvc"
+        } else if cfg!(target_arch = "aarch64") {
+            "aarch64-pc-windows-msvc"
+        } else {
+            "x86_64-pc-windows-msvc"
+        }
     } else if cfg!(target_os = "macos") {
-        "macos"
+        if cfg!(target_arch = "x86_64") {
+            "x86_64-apple-darwin"
+        } else if cfg!(target_arch = "aarch64") {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-apple-darwin"
+        }
     } else {
-        "linux"
-    };
-
-    let arch = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "x86_64"
+        if cfg!(target_arch = "x86_64") {
+            "x86_64-unknown-linux-gnu"
+        } else if cfg!(target_arch = "aarch64") {
+            "aarch64-unknown-linux-gnu"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        }
     };
 
     let ext = if cfg!(target_os = "windows") { ".exe" } else { "" };
 
-    format!("{}-{}-{}{}", binary_name, os, arch, ext)
+    format!("{}-{}{}", binary_name, target, ext)
 }
 
 /// Get the backup directory path

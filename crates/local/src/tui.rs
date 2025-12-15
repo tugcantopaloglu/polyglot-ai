@@ -131,6 +131,7 @@ pub enum AppAction {
     DisableMultiModel,
     ToggleMultiTool(Tool),
     CheckUpdate,
+    PerformUpdate,
 }
 
 impl Default for App {
@@ -464,7 +465,7 @@ impl App {
             }
             Some("update") => {
                 self.add_output(OutputType::System, "Checking for updates...".to_string());
-                AppAction::CheckUpdate
+                AppAction::PerformUpdate
             }
             _ => {
                 self.add_output(OutputType::Error, format!("Unknown command: {}", input));

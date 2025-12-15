@@ -579,15 +579,38 @@ async fn run_tui(tool_manager: LocalToolManager, _config: &LocalConfig, mut hist
                                             Ok(info) => {
                                                 if info.update_available {
                                                     app.add_output(OutputType::System,
-                                                        format!("🆕 Update available: v{} → v{}", info.current_version, info.latest_version));
+                                                        format!("Update available: v{} -> v{}", info.current_version, info.latest_version));
                                                     app.add_output(OutputType::System,
-                                                        "   Run 'polyglot-local update' from terminal to install.".to_string());
-                                                    if let Some(url) = info.download_url {
-                                                        app.add_output(OutputType::System, format!("   Download: {}", url));
+                                                        "   Use /update to install.".to_string());
+                                                } else {
+                                                    app.add_output(OutputType::System,
+                                                        format!("You are running the latest version (v{})", info.current_version));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                app.add_output(OutputType::Error, format!("Failed to check for updates: {}", e));
+                                            }
+                                        }
+                                    }
+                                    AppAction::PerformUpdate => {
+                                        match check_for_updates_github("polyglot-local").await {
+                                            Ok(info) => {
+                                                if info.update_available {
+                                                    app.add_output(OutputType::System,
+                                                        format!("Updating: v{} -> v{}", info.current_version, info.latest_version));
+                                                    match perform_update_tui(&info, &mut app).await {
+                                                        Ok(true) => {
+                                                            app.add_output(OutputType::System, "Update installed! Please restart the application.".to_string());
+                                                            app.should_quit = true;
+                                                        }
+                                                        Ok(false) => {}
+                                                        Err(e) => {
+                                                            app.add_output(OutputType::Error, format!("Update failed: {}", e));
+                                                        }
                                                     }
                                                 } else {
                                                     app.add_output(OutputType::System,
-                                                        format!("✓ You are running the latest version (v{})", info.current_version));
+                                                        format!("You are running the latest version (v{})", info.current_version));
                                                 }
                                             }
                                             Err(e) => {
@@ -1420,6 +1443,81 @@ async fn perform_update(update_info: &polyglot_common::updater::UpdateInfo) -> R
     println!("\x1b[32m✓ Update complete! Please restart the application.\x1b[0m");
 
     Ok(())
+}
+
+/// Perform update from within TUI
+async fn perform_update_tui(update_info: &polyglot_common::updater::UpdateInfo, app: &mut tui::App) -> Result<bool> {
+    use polyglot_common::updater::*;
+
+    let download_url = match update_info.download_url.as_ref() {
+        Some(url) => url,
+        None => {
+            app.add_output(tui::OutputType::Error, "No download URL available for your platform".to_string());
+            return Ok(false);
+        }
+    };
+
+    let current_exe = get_current_exe()?;
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    app.add_output(tui::OutputType::System, "Creating backup...".to_string());
+    let _backup_info = create_backup(&current_exe, current_version)?;
+
+    app.add_output(tui::OutputType::System, format!("Downloading v{}...", update_info.latest_version));
+
+    let client = reqwest::Client::builder()
+        .user_agent("polyglot-ai-updater")
+        .build()?;
+
+    let response = client.get(download_url).send().await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Download failed: HTTP {}", response.status());
+    }
+
+    let new_binary = response.bytes().await?;
+    app.add_output(tui::OutputType::System, format!("Downloaded {} bytes", new_binary.len()));
+
+    app.add_output(tui::OutputType::System, "Installing update...".to_string());
+
+    let temp_path = current_exe.with_extension("new");
+
+    std::fs::write(&temp_path, &new_binary)?;
+
+    app.add_output(tui::OutputType::System, "Verifying binary...".to_string());
+
+    if !verify_binary(&temp_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        anyhow::bail!("Downloaded binary is invalid");
+    }
+
+    app.add_output(tui::OutputType::System, "Replacing binary...".to_string());
+
+    #[cfg(windows)]
+    {
+        let old_path = current_exe.with_extension("old");
+        let _ = std::fs::remove_file(&old_path);
+        std::fs::rename(&current_exe, &old_path)?;
+        std::fs::rename(&temp_path, &current_exe)?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(&temp_path, &current_exe)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&current_exe)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&current_exe, perms)?;
+        }
+    }
+
+    let _ = cleanup_old_backups(3);
+
+    app.add_output(tui::OutputType::System, format!("Successfully updated to v{}!", update_info.latest_version));
+
+    Ok(true)
 }
 
 /// Check for updates on startup (non-blocking notification)
