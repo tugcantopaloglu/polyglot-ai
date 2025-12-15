@@ -17,15 +17,17 @@ COPY Cargo.toml ./
 COPY crates/common/Cargo.toml crates/common/
 COPY crates/server/Cargo.toml crates/server/
 COPY crates/client/Cargo.toml crates/client/
+COPY crates/local/Cargo.toml crates/local/
+
+# Create dummy source files for dependency caching
+RUN mkdir -p crates/common/src crates/server/src crates/client/src crates/local/src && \
+    echo "pub fn dummy() {}" > crates/common/src/lib.rs && \
+    echo "fn main() {}" > crates/server/src/main.rs && \
+    echo "fn main() {}" > crates/client/src/main.rs && \
+    echo "fn main() {}" > crates/local/src/main.rs
 
 # Generate lockfile for reproducible builds
 RUN cargo generate-lockfile
-
-# Create dummy source files for dependency caching
-RUN mkdir -p crates/common/src crates/server/src crates/client/src && \
-    echo "pub fn dummy() {}" > crates/common/src/lib.rs && \
-    echo "fn main() {}" > crates/server/src/main.rs && \
-    echo "fn main() {}" > crates/client/src/main.rs
 
 # Build dependencies only
 RUN cargo build --release --locked --package polyglot-client && \

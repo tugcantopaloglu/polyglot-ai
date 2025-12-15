@@ -411,6 +411,23 @@ async fn run_tui_interactive(
     use tokio::sync::mpsc;
 
     enable_raw_mode()?;
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, SetConsoleMode, GetStdHandle,
+            STD_INPUT_HANDLE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+        };
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut mode: u32 = 0;
+            if GetConsoleMode(handle, &mut mode) != 0 {
+                mode &= !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
+                SetConsoleMode(handle, mode);
+            }
+        }
+    }
+
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
