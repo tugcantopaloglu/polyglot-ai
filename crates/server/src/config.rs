@@ -250,11 +250,11 @@ impl Default for UpdateSettings {
     fn default() -> Self {
         Self {
             check_updates: true,
-            update_check_url: "https://api.github.com/repos/tugcantopaloglu/selfhosted-ai-code-platform/releases/latest".to_string(),
+            update_check_url: "https://api.github.com/repos/tugcantopaloglu/polyglot-ai/releases/latest".to_string(),
             min_client_version: None,
             graceful_shutdown_timeout: 30,
             update_message: None,
-            client_download_url: Some("https://github.com/tugcantopaloglu/selfhosted-ai-code-platform/releases".to_string()),
+            client_download_url: Some("https://github.com/tugcantopaloglu/polyglot-ai/releases".to_string()),
         }
     }
 }

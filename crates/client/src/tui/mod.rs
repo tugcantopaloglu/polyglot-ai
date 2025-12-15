@@ -545,7 +545,7 @@ fn draw_about_view(f: &mut Frame, area: Rect) {
             Span::styled("  → ", Style::default().fg(Color::Green)),
             Span::styled("Please open an issue on GitHub:", Style::default().fg(Color::White)),
         ]),
-        Line::from(Span::styled("    https://github.com/tugcantopaloglu/selfhosted-ai-code-platform/issues", Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled("    https://github.com/tugcantopaloglu/polyglot-ai/issues", Style::default().fg(Color::Cyan))),
         Line::from(""),
         Line::from(Span::styled("  → ", Style::default().fg(Color::Green)),
         ),

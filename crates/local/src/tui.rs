@@ -9,6 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use polyglot_common::{Tool, ToolUsage, HistoryEntry};
 
@@ -282,8 +283,14 @@ impl App {
         }
     }
 
-    fn handle_chat_key(&mut self, code: KeyCode, _modifiers: KeyModifiers) -> Option<AppAction> {
+    fn handle_chat_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<AppAction> {
         match code {
+            KeyCode::Esc => {
+                self.input.clear();
+                self.cursor_position = 0;
+                None
+            }
+
             KeyCode::Enter => {
                 if !self.input.is_empty() {
                     let input = self.input.clone();
@@ -307,8 +314,18 @@ impl App {
                 None
             }
 
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.clear();
+                self.cursor_position = 0;
+                None
+            }
+
             KeyCode::Char(c) => {
-                self.input.insert(self.cursor_position, c);
+                let byte_pos = self.input.char_indices()
+                    .nth(self.cursor_position)
+                    .map(|(i, _)| i)
+                    .unwrap_or(self.input.len());
+                self.input.insert(byte_pos, c);
                 self.cursor_position += 1;
                 None
             }
@@ -316,14 +333,19 @@ impl App {
             KeyCode::Backspace => {
                 if self.cursor_position > 0 {
                     self.cursor_position -= 1;
-                    self.input.remove(self.cursor_position);
+                    if let Some((byte_pos, ch)) = self.input.char_indices().nth(self.cursor_position) {
+                        self.input.drain(byte_pos..byte_pos + ch.len_utf8());
+                    }
                 }
                 None
             }
 
             KeyCode::Delete => {
-                if self.cursor_position < self.input.len() {
-                    self.input.remove(self.cursor_position);
+                let char_count = self.input.chars().count();
+                if self.cursor_position < char_count {
+                    if let Some((byte_pos, ch)) = self.input.char_indices().nth(self.cursor_position) {
+                        self.input.drain(byte_pos..byte_pos + ch.len_utf8());
+                    }
                 }
                 None
             }
@@ -334,12 +356,13 @@ impl App {
             }
 
             KeyCode::Right => {
-                self.cursor_position = (self.cursor_position + 1).min(self.input.len());
+                let char_count = self.input.chars().count();
+                self.cursor_position = (self.cursor_position + 1).min(char_count);
                 None
             }
 
             KeyCode::Home => { self.cursor_position = 0; None }
-            KeyCode::End => { self.cursor_position = self.input.len(); None }
+            KeyCode::End => { self.cursor_position = self.input.chars().count(); None }
 
             _ => None,
         }
@@ -714,7 +737,7 @@ fn draw_about_view(f: &mut Frame, area: Rect) {
             Span::styled("  → ", Style::default().fg(Color::Green)),
             Span::styled("Please open an issue on GitHub:", Style::default().fg(Color::White)),
         ]),
-        Line::from(Span::styled("    https://github.com/tugcantopaloglu/selfhosted-ai-code-platform/issues", Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled("    https://github.com/tugcantopaloglu/polyglot-ai/issues", Style::default().fg(Color::Cyan))),
         Line::from(""),
         Line::from(Span::styled("  → ", Style::default().fg(Color::Green)),
         ),
@@ -960,8 +983,13 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::ALL).title("Input"));
     f.render_widget(input, area);
 
+    let cursor_display_pos: usize = app.input.chars()
+        .take(app.cursor_position)
+        .collect::<String>()
+        .width();
+
     f.set_cursor_position((
-        area.x + app.cursor_position as u16 + 1,
+        area.x + cursor_display_pos as u16 + 1,
         area.y + 1,
     ));
 }

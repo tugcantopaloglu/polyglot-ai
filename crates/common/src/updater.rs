@@ -79,7 +79,7 @@ pub struct UpdateConfig {
 impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
-            github_repo: "tugcantopaloglu/selfhosted-ai-code-platform".to_string(),
+            github_repo: "tugcantopaloglu/polyglot-ai".to_string(),
             current_version: env!("CARGO_PKG_VERSION").to_string(),
             binary_name: "polyglot".to_string(),
             check_prerelease: false,

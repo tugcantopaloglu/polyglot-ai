@@ -1871,6 +1871,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.0",
  "uuid",
  "which",
  "windows-sys 0.59.0",

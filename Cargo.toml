@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Tugcan Topaloglu"]
 license = "MIT"
-repository = "https://github.com/tugcantopaloglu/selfhosted-ai-code-platform"
+repository = "https://github.com/tugcantopaloglu/polyglot-ai"
 
 [workspace.dependencies]
 # Async runtime
