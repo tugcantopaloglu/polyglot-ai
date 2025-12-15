@@ -4,6 +4,7 @@ mod tui;
 mod history;
 mod plugins;
 mod environment;
+mod sandbox;
 
 use std::path::PathBuf;
 use std::io::{self, Write};

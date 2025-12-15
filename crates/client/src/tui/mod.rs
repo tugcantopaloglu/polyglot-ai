@@ -599,12 +599,23 @@ fn draw_about_view(f: &mut Frame, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App) {
+    let input_width = area.width.saturating_sub(3) as usize;
+
+    let scroll_offset = if app.cursor_display_pos >= input_width {
+        app.cursor_display_pos.saturating_sub(input_width) + 1
+    } else {
+        0
+    };
+
+    let visible_cursor_pos = app.cursor_display_pos.saturating_sub(scroll_offset);
+
     let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title("Input"));
+        .block(Block::default().borders(Borders::ALL).title("Input"))
+        .scroll((0, scroll_offset as u16));
     f.render_widget(input, area);
 
     f.set_cursor_position((
-        area.x + app.cursor_display_pos as u16 + 1,
+        area.x + visible_cursor_pos as u16 + 1,
         area.y + 1,
     ));
 }
