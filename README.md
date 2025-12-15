@@ -1,4 +1,5 @@
-﻿# Polyglot-AI - multiLLM "vibing" platform
+[![Release](https://github.com/tugcantopaloglu/polyglot-ai/actions/workflows/release.yml/badge.svg)](https://github.com/tugcantopaloglu/polyglot-ai/actions/workflows/release.yml)
+ # Polyglot-AI - multiLLM "vibing" platform
 
 Is developers done? or we are not coding anymore? Who cares. Vibe coding, hard coding (idk what that means but ok) or something else. As a developer and system engineer I always like to use new tools and experiences. So on every one or two weeks I am seeing a new model or new provider making better than previous ones. So i thought it's time to create a multi-platform fast adaptable AI coding tool. First I thought about VSCode extension but I don't like extensions or trust them. So for now this is the beautiful (arguably) solution with TUI. If you don't want to use any cloud LLM for now you can add your models with ollama. Soon I will be adding my solution to implement these local modals.
 
