@@ -22,32 +22,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             suffix: ""
-            archive: tar.gz
-          # Linux ARM64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             suffix: ""
-            archive: tar.gz
             cross: true
-          # macOS x86_64
           - target: x86_64-apple-darwin
             os: macos-latest
             suffix: ""
-            archive: tar.gz
-          # macOS ARM64
           - target: aarch64-apple-darwin
             os: macos-latest
             suffix: ""
-            archive: tar.gz
-          # Windows x86_64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             suffix: ".exe"
-            archive: zip
 
     steps:
       - name: Checkout
@@ -62,22 +52,19 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Generate lockfile
-        run: cargo generate-lockfile
-
       - name: Build with cross
         if: matrix.cross
         run: |
-          cross build --release --locked --target ${{ matrix.target }} -p polyglot-local
-          cross build --release --locked --target ${{ matrix.target }} -p polyglot-client
-          cross build --release --locked --target ${{ matrix.target }} -p polyglot-server
+          cross build --release --target ${{ matrix.target }} -p polyglot-local
+          cross build --release --target ${{ matrix.target }} -p polyglot-client
+          cross build --release --target ${{ matrix.target }} -p polyglot-server
 
       - name: Build native
         if: ${{ !matrix.cross }}
         run: |
-          cargo build --release --locked --target ${{ matrix.target }} -p polyglot-local
-          cargo build --release --locked --target ${{ matrix.target }} -p polyglot-client
-          cargo build --release --locked --target ${{ matrix.target }} -p polyglot-server
+          cargo build --release --target ${{ matrix.target }} -p polyglot-local
+          cargo build --release --target ${{ matrix.target }} -p polyglot-client
+          cargo build --release --target ${{ matrix.target }} -p polyglot-server
 
       - name: Prepare binaries (Unix)
         if: runner.os != 'Windows'
@@ -100,11 +87,9 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cd release
-          # Individual binaries with platform suffix
           mv polyglot-local polyglot-local-${{ matrix.target }}
           mv polyglot polyglot-${{ matrix.target }}
           mv polyglot-server polyglot-server-${{ matrix.target }}
-          # Make executable
           chmod +x polyglot-local-${{ matrix.target }}
           chmod +x polyglot-${{ matrix.target }}
           chmod +x polyglot-server-${{ matrix.target }}
@@ -114,7 +99,6 @@ jobs:
         shell: pwsh
         run: |
           cd release
-          # Individual binaries with platform suffix
           Move-Item "polyglot-local.exe" "polyglot-local-${{ matrix.target }}.exe"
           Move-Item "polyglot.exe" "polyglot-${{ matrix.target }}.exe"
           Move-Item "polyglot-server.exe" "polyglot-server-${{ matrix.target }}.exe"
@@ -154,7 +138,6 @@ jobs:
           fi
 
       - name: Generate changelog
-        id: changelog
         run: |
           echo "## What's Changed" > CHANGELOG.md
           echo "" >> CHANGELOG.md
@@ -193,55 +176,3 @@ jobs:
             artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  docker:
-    name: Build Docker Images
-    needs: release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Get version
-        id: version
-        run: |
-          if [ -n "${{ github.event.inputs.tag }}" ]; then
-            echo "version=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Build and push server image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./docker/Dockerfile.server
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/polyglot-server:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/polyglot-server:latest
-
-      - name: Build and push client image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./docker/Dockerfile.client
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/polyglot-client:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/polyglot-client:latest
