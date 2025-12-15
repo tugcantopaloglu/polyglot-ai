@@ -55,6 +55,9 @@ directories = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
 
+# Unicode
+unicode-width = "0.2"
+
 # HTTP client for updates
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 

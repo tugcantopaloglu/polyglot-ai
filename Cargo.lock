@@ -1803,7 +1803,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "polyglot-client"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1830,6 +1830,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.0",
  "uuid",
  "windows-sys 0.59.0",
  "xxhash-rust",
@@ -1837,7 +1838,7 @@ dependencies = [
 
 [[package]]
 name = "polyglot-common"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "base64",
  "chrono",
@@ -1852,7 +1853,7 @@ dependencies = [
 
 [[package]]
 name = "polyglot-local"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1879,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "polyglot-server"
-version = "0.1.0"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",

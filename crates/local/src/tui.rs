@@ -9,7 +9,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::UnicodeWidthChar;
 
 use polyglot_common::{Tool, ToolUsage, HistoryEntry};
 
@@ -73,6 +73,7 @@ impl MultiModelState {
 pub struct App {
     pub input: String,
     pub cursor_position: usize,
+    pub cursor_display_pos: usize,
     pub output: Vec<OutputLine>,
     pub current_tool: Option<Tool>,
     pub tools: Vec<(Tool, bool)>,
@@ -139,6 +140,7 @@ impl Default for App {
         Self {
             input: String::new(),
             cursor_position: 0,
+            cursor_display_pos: 0,
             output: Vec::new(),
             current_tool: None,
             tools: Vec::new(),
@@ -158,6 +160,13 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn update_cursor_display_pos(&mut self) {
+        self.cursor_display_pos = self.input.chars()
+            .take(self.cursor_position)
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
     }
 
     pub fn add_output(&mut self, line_type: OutputType, content: String) {
@@ -328,6 +337,7 @@ impl App {
                     .unwrap_or(self.input.len());
                 self.input.insert(byte_pos, c);
                 self.cursor_position += 1;
+                self.update_cursor_display_pos();
                 None
             }
 
@@ -337,6 +347,7 @@ impl App {
                     if let Some((byte_pos, ch)) = self.input.char_indices().nth(self.cursor_position) {
                         self.input.drain(byte_pos..byte_pos + ch.len_utf8());
                     }
+                    self.update_cursor_display_pos();
                 }
                 None
             }
@@ -353,17 +364,28 @@ impl App {
 
             KeyCode::Left => {
                 self.cursor_position = self.cursor_position.saturating_sub(1);
+                self.update_cursor_display_pos();
                 None
             }
 
             KeyCode::Right => {
                 let char_count = self.input.chars().count();
                 self.cursor_position = (self.cursor_position + 1).min(char_count);
+                self.update_cursor_display_pos();
                 None
             }
 
-            KeyCode::Home => { self.cursor_position = 0; None }
-            KeyCode::End => { self.cursor_position = self.input.chars().count(); None }
+            KeyCode::Home => {
+                self.cursor_position = 0;
+                self.update_cursor_display_pos();
+                None
+            }
+
+            KeyCode::End => {
+                self.cursor_position = self.input.chars().count();
+                self.update_cursor_display_pos();
+                None
+            }
 
             _ => None,
         }
@@ -985,13 +1007,8 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::ALL).title("Input"));
     f.render_widget(input, area);
 
-    let cursor_display_pos: usize = app.input.chars()
-        .take(app.cursor_position)
-        .collect::<String>()
-        .width();
-
     f.set_cursor_position((
-        area.x + cursor_display_pos as u16 + 1,
+        area.x + app.cursor_display_pos as u16 + 1,
         area.y + 1,
     ));
 }

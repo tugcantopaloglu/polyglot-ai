@@ -22,10 +22,12 @@ use ratatui::{
     Frame, Terminal,
 };
 use polyglot_common::{Tool, ToolUsage};
+use unicode_width::UnicodeWidthChar;
 
 pub struct App {
     pub input: String,
     pub cursor_position: usize,
+    pub cursor_display_pos: usize,
     pub output: Vec<OutputLine>,
     pub current_tool: Option<Tool>,
     pub connected: bool,
@@ -66,6 +68,7 @@ impl Default for App {
         Self {
             input: String::new(),
             cursor_position: 0,
+            cursor_display_pos: 0,
             output: Vec::new(),
             current_tool: None,
             connected: false,
@@ -82,6 +85,13 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn update_cursor_display_pos(&mut self) {
+        self.cursor_display_pos = self.input.chars()
+            .take(self.cursor_position)
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
     }
 
     pub fn add_output(&mut self, line_type: OutputType, content: String) {
@@ -159,43 +169,59 @@ impl App {
             }
 
             KeyCode::Char(c) => {
-                self.input.insert(self.cursor_position, c);
+                let byte_pos = self.input.char_indices()
+                    .nth(self.cursor_position)
+                    .map(|(i, _)| i)
+                    .unwrap_or(self.input.len());
+                self.input.insert(byte_pos, c);
                 self.cursor_position += 1;
+                self.update_cursor_display_pos();
                 None
             }
 
             KeyCode::Backspace => {
                 if self.cursor_position > 0 {
                     self.cursor_position -= 1;
-                    self.input.remove(self.cursor_position);
+                    if let Some((byte_pos, ch)) = self.input.char_indices().nth(self.cursor_position) {
+                        self.input.drain(byte_pos..byte_pos + ch.len_utf8());
+                    }
+                    self.update_cursor_display_pos();
                 }
                 None
             }
 
             KeyCode::Delete => {
-                if self.cursor_position < self.input.len() {
-                    self.input.remove(self.cursor_position);
+                let char_count = self.input.chars().count();
+                if self.cursor_position < char_count {
+                    if let Some((byte_pos, ch)) = self.input.char_indices().nth(self.cursor_position) {
+                        self.input.drain(byte_pos..byte_pos + ch.len_utf8());
+                    }
                 }
                 None
             }
 
             KeyCode::Left => {
                 self.cursor_position = self.cursor_position.saturating_sub(1);
+                self.update_cursor_display_pos();
                 None
             }
 
             KeyCode::Right => {
-                self.cursor_position = (self.cursor_position + 1).min(self.input.len());
+                let char_count = self.input.chars().count();
+                self.cursor_position = (self.cursor_position + 1).min(char_count);
+                self.update_cursor_display_pos();
                 None
             }
 
             KeyCode::Home => {
                 self.cursor_position = 0;
+                self.update_cursor_display_pos();
                 None
             }
 
             KeyCode::End => {
-                self.cursor_position = self.input.len();
+                self.cursor_position = self.input.chars().count();
+                self.update_cursor_display_pos();
                 None
             }
 
@@ -307,8 +333,10 @@ fn run_event_loop(
         terminal.draw(|f| draw_ui(f, app))?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if let Some(_action) = app.handle_key(key.code, key.modifiers) {
+            while event::poll(Duration::from_millis(0))? {
+                if let Event::Key(key) = event::read()? {
+                    if let Some(_action) = app.handle_key(key.code, key.modifiers) {
+                    }
                 }
             }
         }
@@ -576,7 +604,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(input, area);
 
     f.set_cursor_position((
-        area.x + app.cursor_position as u16 + 1,
+        area.x + app.cursor_display_pos as u16 + 1,
         area.y + 1,
     ));
 }
