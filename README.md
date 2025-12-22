@@ -58,15 +58,17 @@ Both modes share the same features: automatic tool rotation on rate limits, unif
 
 ```
 polyglot-ai/
-â”œâ”€â”€ crates/
-â”‚   â”œâ”€â”€ common/     # Shared types, protocol definitions, utilities
-â”‚   â”œâ”€â”€ local/      # Standalone local binary (polyglot-local)
-â”‚   â”œâ”€â”€ client/     # Client binary for server mode (polyglot)
-â”‚   â””â”€â”€ server/     # Server binary (polyglot-server)
-â”œâ”€â”€ config/         # Example configuration files
-â”œâ”€â”€ docker/         # Dockerfiles for containerized deployment
-â””â”€â”€ scripts/        # Installation and setup scripts
+|-- crates/
+|   |-- common/     # Shared types, protocol definitions, utilities
+|   |-- local/      # Standalone local binary (polyglot-local)
+|   |-- client/     # Client binary for server mode (polyglot)
+|   |-- server/     # Server binary (polyglot-server)
+|   `-- bridge/     # WebSocket bridge (polyglot-bridge)
+|-- config/         # Example configuration files
+|-- docker/         # Dockerfiles for containerized deployment
+`-- scripts/        # Installation and setup scripts
 ```
+
 
 Communication between client and server uses QUIC (UDP-based) with MessagePack serialization for efficiency.
 
