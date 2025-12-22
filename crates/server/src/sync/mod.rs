@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 mod realtime;
-mod ondemand;
+pub mod ondemand;
 
 use thiserror::Error;
 use std::path::PathBuf;

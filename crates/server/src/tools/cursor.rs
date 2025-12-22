@@ -91,6 +91,9 @@ impl ToolAdapter for CursorAdapter {
         for (key, value) in &self.env {
             cmd.env(key, value);
         }
+        for (key, value) in &request.env {
+            cmd.env(key, value);
+        }
 
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

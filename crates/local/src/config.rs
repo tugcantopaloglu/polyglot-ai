@@ -23,6 +23,25 @@ pub struct LocalConfig {
 
     #[serde(default)]
     pub plugins: Vec<PluginConfig>,
+
+    #[serde(default)]
+    pub drive: DriveConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriveConfig {
+    #[serde(default)]
+    pub remote: Option<String>,
+
+    #[serde(default = "default_drive_path")]
+    pub path: PathBuf,
+}
+
+fn default_drive_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("polyglot-ai")
+        .join("history")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +239,16 @@ impl Default for LocalConfig {
             isolation: IsolationConfig::default(),
             sandbox: SandboxConfig::default(),
             plugins: Vec::new(),
+            drive: DriveConfig::default(),
+        }
+    }
+}
+
+impl Default for DriveConfig {
+    fn default() -> Self {
+        Self {
+            remote: None,
+            path: default_drive_path(),
         }
     }
 }
@@ -374,6 +403,13 @@ show_timestamps = true
 
 # Color theme
 theme = "default"
+
+[drive]
+# Optional rclone remote (example: "gdrive:polyglot-ai")
+remote = ""
+
+# Local path to sync (defaults to the history folder)
+path = "~/.local/share/polyglot-ai/history"
 
 # Custom Plugins
 # ===============

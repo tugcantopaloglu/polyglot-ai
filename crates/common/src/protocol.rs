@@ -64,6 +64,11 @@ pub enum ClientMessage {
 
     /// Check for server version and updates
     VersionCheck,
+
+    /// Set environment variables for this session (BYOK relay)
+    SetEnv {
+        entries: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +169,11 @@ pub enum ServerMessage {
         reason: String,
         /// Seconds until shutdown
         countdown: u32,
+    },
+
+    /// Acknowledge environment variable updates
+    EnvAck {
+        applied: u32,
     },
 }
 
