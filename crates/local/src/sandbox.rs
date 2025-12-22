@@ -152,6 +152,7 @@ impl SandboxConfig {
 #[cfg(unix)]
 pub mod unix {
     use super::*;
+    use std::os::unix::process::CommandExt;
     use tokio::process::Command;
 
     pub fn apply_resource_limits(cmd: &mut Command, config: &SandboxConfig) {

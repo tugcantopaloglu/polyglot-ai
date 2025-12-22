@@ -1861,6 +1861,7 @@ dependencies = [
  "crossterm 0.29.0",
  "directories",
  "dirs",
+ "libc",
  "parking_lot",
  "polyglot-common",
  "ratatui",
