@@ -131,7 +131,6 @@ pub enum AppAction {
     EnableMultiModel(Vec<Tool>),
     DisableMultiModel,
     ToggleMultiTool(Tool),
-    CheckUpdate,
     PerformUpdate,
 }
 

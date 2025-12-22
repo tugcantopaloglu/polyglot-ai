@@ -273,6 +273,22 @@ impl LocalToolManager {
         }
 
         let working_dir = std::env::current_dir().unwrap_or_else(|_| self.inner.sandbox.get_workspace_dir());
+        if let Err(e) = self.inner.sandbox.validate_path_read(&working_dir) {
+            let _ = output_tx.send(ToolOutput::Error(format!(
+                "Sandbox read access denied for {}: {}",
+                working_dir.display(),
+                e
+            ))).await;
+            return Err(e);
+        }
+        if let Err(e) = self.inner.sandbox.validate_path_write(&working_dir) {
+            let _ = output_tx.send(ToolOutput::Error(format!(
+                "Sandbox write access denied for {}: {}",
+                working_dir.display(),
+                e
+            ))).await;
+            return Err(e);
+        }
         cmd.current_dir(&working_dir);
 
         cmd.stdout(Stdio::piped());

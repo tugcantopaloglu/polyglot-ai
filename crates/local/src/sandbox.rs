@@ -138,6 +138,8 @@ impl SandboxConfig {
         env.push(("POLYGLOT_SANDBOX".to_string(), "1".to_string()));
         env.push(("POLYGLOT_TOOL".to_string(), tool.as_str().to_string()));
         env.push(("POLYGLOT_WORKSPACE".to_string(), self.get_workspace_dir().to_string_lossy().to_string()));
+        env.push(("POLYGLOT_TOOLS_DIR".to_string(), self.get_tools_dir().to_string_lossy().to_string()));
+        env.push(("POLYGLOT_CACHE_DIR".to_string(), self.get_cache_dir().to_string_lossy().to_string()));
 
         if let Ok(current_dir) = std::env::current_dir() {
             env.push(("POLYGLOT_PROJECT_DIR".to_string(), current_dir.to_string_lossy().to_string()));
@@ -159,6 +161,8 @@ pub mod unix {
         if !config.enabled {
             return;
         }
+
+        let _ = (config.max_cpu_percent, config.network_access);
 
         if let Some(max_mem_mb) = config.max_memory_mb {
             let max_mem_bytes = max_mem_mb * 1024 * 1024;
@@ -186,5 +190,7 @@ pub mod windows {
         if !config.enabled {
             return;
         }
+
+        let _ = (config.max_memory_mb, config.max_cpu_percent, config.network_access);
     }
 }
