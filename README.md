@@ -23,6 +23,7 @@ So shortly a self-hosted platform that aggregates multiple AI coding assistants 
   - [Local Mode](#local-mode)
   - [Client-Server Mode](#client-server-mode)
   - [Multi-Model Mode](#multi-model-mode)
+  - [Mobile Bridge](#mobile-bridge)
 - [Supported Tools](#supported-tools)
 - [Certificate Setup](#certificate-setup)
 - [Troubleshooting](#troubleshooting)
@@ -89,6 +90,7 @@ cargo build --release
 # - polyglot-local (standalone)
 # - polyglot (client)
 # - polyglot-server (server)
+# - polyglot-bridge (mobile WebSocket bridge)
 ```
 
 ### From Releases
@@ -175,6 +177,26 @@ polyglot-server start -c config/server.toml
 
 # 3. Connect with client
 polyglot connect -c config/client.toml
+```
+
+### Mobile Bridge
+
+Expo clients cannot speak QUIC directly. Use the WebSocket bridge to connect mobile apps to a Polyglot server:
+
+```bash
+# Build the bridge
+cargo build -p polyglot-bridge --release
+
+# Start the bridge (WS on 8787, QUIC to server on 4433)
+target/release/polyglot-bridge --listen 0.0.0.0:8787 --server 127.0.0.1:4433
+```
+
+Point the mobile app at `ws://<host>:8787/ws` (or `wss://...` behind TLS). Set `--token` to require a shared access token.
+
+Local-only mode (runs `polyglot-local` on the same machine):
+
+```bash
+target/release/polyglot-bridge --listen 0.0.0.0:8787 --mode local --local-bin polyglot-local
 ```
 
 ## Configuration

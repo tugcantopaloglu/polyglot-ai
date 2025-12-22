@@ -577,24 +577,6 @@ async fn run_tui(tool_manager: LocalToolManager, _config: &LocalConfig, mut hist
                                             }
                                         });
                                     }
-                                    AppAction::CheckUpdate => {
-                                        match check_for_updates_github("polyglot-local").await {
-                                            Ok(info) => {
-                                                if info.update_available {
-                                                    app.add_output(OutputType::System,
-                                                        format!("Update available: v{} -> v{}", info.current_version, info.latest_version));
-                                                    app.add_output(OutputType::System,
-                                                        "   Use /update to install.".to_string());
-                                                } else {
-                                                    app.add_output(OutputType::System,
-                                                        format!("You are running the latest version (v{})", info.current_version));
-                                                }
-                                            }
-                                            Err(e) => {
-                                                app.add_output(OutputType::Error, format!("Failed to check for updates: {}", e));
-                                            }
-                                        }
-                                    }
                                     AppAction::PerformUpdate => {
                                         match check_for_updates_github("polyglot-local").await {
                                             Ok(info) => {
