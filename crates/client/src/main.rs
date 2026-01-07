@@ -873,9 +873,10 @@ async fn run_health(config: &ClientConfig) -> Result<()> {
     conn.connect(&config.connection).await?;
 
     match conn.health_check().await {
-        Ok(ServerMessage::HealthStatus { tools, all_healthy }) => {
+        Ok(ServerMessage::HealthStatus { tools, server_healthy, uptime_seconds }) => {
             println!("Tool Health Status");
             println!("==================");
+            println!("Server uptime: {}s", uptime_seconds);
             println!();
 
             for tool in tools {
@@ -885,14 +886,13 @@ async fn run_health(config: &ClientConfig) -> Result<()> {
                 if let Some(latency) = tool.latency_ms {
                     println!("  Latency: {}ms", latency);
                 }
-                println!("  Failure count: {}", tool.failure_count);
-                if let Some(last) = tool.last_check {
-                    println!("  Last check: {}", last);
-                }
+                println!("  Error rate: {:.1}%", tool.error_rate * 100.0);
+                println!("  Consecutive failures: {}", tool.consecutive_failures);
+                println!("  Last check: {}", tool.last_check);
                 println!();
             }
 
-            if all_healthy {
+            if server_healthy {
                 println!("\x1b[32m✓ All tools are healthy\x1b[0m");
             } else {
                 println!("\x1b[33m⚠ Some tools are experiencing issues\x1b[0m");
@@ -920,32 +920,34 @@ async fn run_quota(config: &ClientConfig) -> Result<()> {
     conn.connect(&config.connection).await?;
 
     match conn.quota_check().await {
-        Ok(ServerMessage::QuotaInfo { user_id, requests_used, requests_limit, tokens_used, tokens_limit, reset_at }) => {
-            println!("Quota Status for {}", user_id);
-            println!("==================");
+        Ok(ServerMessage::QuotaInfo { daily_limit, daily_used, monthly_limit, monthly_used, reset_at }) => {
+            println!("Quota Status");
+            println!("============");
             println!();
 
-            let req_pct = if let Some(limit) = requests_limit {
-                (requests_used as f64 / limit as f64 * 100.0) as u32
+            // Daily usage
+            let daily_pct = if let Some(limit) = daily_limit {
+                (daily_used as f64 / limit as f64 * 100.0) as u32
             } else {
                 0
             };
 
-            println!("Requests: {} / {}", requests_used, requests_limit.map(|l| l.to_string()).unwrap_or("unlimited".to_string()));
-            if requests_limit.is_some() {
-                println!("  Usage: {}%", req_pct);
+            println!("Daily: {} / {}", daily_used, daily_limit.map(|l| l.to_string()).unwrap_or("unlimited".to_string()));
+            if daily_limit.is_some() {
+                println!("  Usage: {}%", daily_pct);
             }
             println!();
 
-            let tok_pct = if let Some(limit) = tokens_limit {
-                (tokens_used as f64 / limit as f64 * 100.0) as u32
+            // Monthly usage
+            let monthly_pct = if let Some(limit) = monthly_limit {
+                (monthly_used as f64 / limit as f64 * 100.0) as u32
             } else {
                 0
             };
 
-            println!("Tokens: {} / {}", tokens_used, tokens_limit.map(|l| l.to_string()).unwrap_or("unlimited".to_string()));
-            if tokens_limit.is_some() {
-                println!("  Usage: {}%", tok_pct);
+            println!("Monthly: {} / {}", monthly_used, monthly_limit.map(|l| l.to_string()).unwrap_or("unlimited".to_string()));
+            if monthly_limit.is_some() {
+                println!("  Usage: {}%", monthly_pct);
             }
             println!();
 
@@ -975,23 +977,23 @@ async fn run_metrics(config: &ClientConfig) -> Result<()> {
     conn.connect(&config.connection).await?;
 
     match conn.get_metrics().await {
-        Ok(ServerMessage::Metrics { metrics }) => {
+        Ok(ServerMessage::Metrics { active_connections, total_requests, requests_per_minute, tool_stats, cache_stats, uptime_seconds }) => {
             println!("Server Metrics");
             println!("==============");
             println!();
-            println!("Active connections: {}", metrics.active_connections);
-            println!("Total requests: {}", metrics.total_requests);
-            println!("Requests/min: {:.2}", metrics.requests_per_minute);
-            println!("Uptime: {}s", metrics.uptime_seconds);
+            println!("Active connections: {}", active_connections);
+            println!("Total requests: {}", total_requests);
+            println!("Requests/min: {:.2}", requests_per_minute);
+            println!("Uptime: {}s", uptime_seconds);
             println!();
             println!("Cache:");
-            println!("  Hits: {}", metrics.cache_stats.hits);
-            println!("  Misses: {}", metrics.cache_stats.misses);
-            println!("  Entries: {}", metrics.cache_stats.entries);
-            println!("  Memory: {} bytes", metrics.cache_stats.memory_bytes);
+            println!("  Hits: {}", cache_stats.hits);
+            println!("  Misses: {}", cache_stats.misses);
+            println!("  Entries: {}", cache_stats.entries);
+            println!("  Memory: {} bytes", cache_stats.memory_bytes);
             println!();
             println!("Tool Statistics:");
-            for stat in &metrics.tool_stats {
+            for stat in &tool_stats {
                 println!("  {}:", stat.tool.display_name());
                 println!("    Requests: {} (success: {}, failed: {})",
                     stat.total_requests, stat.successful_requests, stat.failed_requests);
@@ -1030,13 +1032,13 @@ async fn run_export(config: &ClientConfig, format: &str, output: Option<PathBuf>
     let mut conn = ClientConnection::new(&config.connection).await?;
     conn.connect(&config.connection).await?;
 
-    match conn.export_history(export_format).await {
-        Ok(ServerMessage::HistoryExport { format: _, content }) => {
+    match conn.export_history(export_format, None).await {
+        Ok(ServerMessage::HistoryExport { format: _, data, session_count }) => {
             if let Some(path) = output {
-                std::fs::write(&path, &content)?;
-                println!("Exported history to {:?}", path);
+                std::fs::write(&path, &data)?;
+                println!("Exported {} sessions to {:?}", session_count, path);
             } else {
-                println!("{}", content);
+                println!("{}", data);
             }
         }
         Ok(ServerMessage::Error { code, message }) => {

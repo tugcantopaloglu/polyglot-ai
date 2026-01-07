@@ -313,14 +313,14 @@ impl ClientConnection {
     }
 
     /// Export chat history in specified format
-    pub async fn export_history(&mut self, format: ExportFormat) -> Result<ServerMessage> {
-        self.send_message(&ClientMessage::ExportHistory { format }).await?;
+    pub async fn export_history(&mut self, format: ExportFormat, session_id: Option<String>) -> Result<ServerMessage> {
+        self.send_message(&ClientMessage::ExportHistory { session_id, format }).await?;
         self.recv_message().await
     }
 
     /// Refresh authentication token
-    pub async fn refresh_token(&mut self) -> Result<ServerMessage> {
-        self.send_message(&ClientMessage::RefreshToken).await?;
+    pub async fn refresh_token(&mut self, current_token: &str) -> Result<ServerMessage> {
+        self.send_message(&ClientMessage::RefreshToken { current_token: current_token.to_string() }).await?;
         self.recv_message().await
     }
 

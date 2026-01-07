@@ -5,7 +5,9 @@
       "Bash(cargo fmt:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(cargo update:*)",
+      "Bash(cargo tree:*)"
     ]
   }
 }
