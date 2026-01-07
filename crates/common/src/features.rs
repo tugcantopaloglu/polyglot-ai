@@ -1388,6 +1388,506 @@ pub struct StreamChunk {
     pub is_final: bool,
 }
 
+// =============================================================================
+// Load Balancing
+// =============================================================================
+
+/// Load balancing strategy for distributing requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalanceStrategy {
+    /// Round-robin distribution
+    RoundRobin,
+    /// Least connections (prefer instances with fewer active requests)
+    LeastConnections,
+    /// Weighted distribution based on instance capacity
+    Weighted,
+    /// Random selection
+    Random,
+    /// Fastest response time
+    FastestResponse,
+}
+
+impl Default for LoadBalanceStrategy {
+    fn default() -> Self {
+        Self::RoundRobin
+    }
+}
+
+/// A tool instance for load balancing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInstance {
+    pub id: String,
+    pub tool: Tool,
+    pub endpoint: String,
+    pub weight: u32,
+    pub healthy: bool,
+    pub active_connections: u32,
+    pub avg_response_time_ms: u32,
+}
+
+/// Load balancer for distributing requests across tool instances
+pub struct LoadBalancer {
+    instances: RwLock<HashMap<Tool, Vec<ToolInstance>>>,
+    strategy: LoadBalanceStrategy,
+    round_robin_index: RwLock<HashMap<Tool, usize>>,
+}
+
+impl LoadBalancer {
+    pub fn new(strategy: LoadBalanceStrategy) -> Self {
+        Self {
+            instances: RwLock::new(HashMap::new()),
+            strategy,
+            round_robin_index: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a tool instance
+    pub fn register(&self, instance: ToolInstance) {
+        let mut instances = self.instances.write();
+        instances.entry(instance.tool)
+            .or_insert_with(Vec::new)
+            .push(instance);
+    }
+
+    /// Unregister a tool instance
+    pub fn unregister(&self, tool: Tool, instance_id: &str) {
+        let mut instances = self.instances.write();
+        if let Some(list) = instances.get_mut(&tool) {
+            list.retain(|i| i.id != instance_id);
+        }
+    }
+
+    /// Update instance health status
+    pub fn set_health(&self, tool: Tool, instance_id: &str, healthy: bool) {
+        let mut instances = self.instances.write();
+        if let Some(list) = instances.get_mut(&tool) {
+            if let Some(instance) = list.iter_mut().find(|i| i.id == instance_id) {
+                instance.healthy = healthy;
+            }
+        }
+    }
+
+    /// Update instance metrics
+    pub fn update_metrics(&self, tool: Tool, instance_id: &str, active: i32, response_time: Option<u32>) {
+        let mut instances = self.instances.write();
+        if let Some(list) = instances.get_mut(&tool) {
+            if let Some(instance) = list.iter_mut().find(|i| i.id == instance_id) {
+                instance.active_connections = (instance.active_connections as i32 + active).max(0) as u32;
+                if let Some(time) = response_time {
+                    // Exponential moving average
+                    instance.avg_response_time_ms =
+                        (instance.avg_response_time_ms * 7 + time * 3) / 10;
+                }
+            }
+        }
+    }
+
+    /// Select the best instance for a tool based on strategy
+    pub fn select(&self, tool: Tool) -> Option<ToolInstance> {
+        let instances = self.instances.read();
+        let list = instances.get(&tool)?;
+        let healthy: Vec<_> = list.iter().filter(|i| i.healthy).collect();
+
+        if healthy.is_empty() {
+            return None;
+        }
+
+        let selected = match self.strategy {
+            LoadBalanceStrategy::RoundRobin => {
+                let mut index = self.round_robin_index.write();
+                let idx = index.entry(tool).or_insert(0);
+                let instance = healthy.get(*idx % healthy.len())?;
+                *idx = (*idx + 1) % healthy.len();
+                (*instance).clone()
+            }
+            LoadBalanceStrategy::LeastConnections => {
+                (*healthy.iter()
+                    .min_by_key(|i| i.active_connections)?).clone()
+            }
+            LoadBalanceStrategy::Weighted => {
+                let total_weight: u32 = healthy.iter().map(|i| i.weight).sum();
+                if total_weight == 0 {
+                    return healthy.first().map(|i| (*i).clone());
+                }
+                let mut rng_val = (Instant::now().elapsed().as_nanos() as u32) % total_weight;
+                for instance in &healthy {
+                    if rng_val < instance.weight {
+                        return Some((*instance).clone());
+                    }
+                    rng_val -= instance.weight;
+                }
+                healthy.first().map(|i| (*i).clone())?
+            }
+            LoadBalanceStrategy::Random => {
+                let idx = (Instant::now().elapsed().as_nanos() as usize) % healthy.len();
+                healthy.get(idx).map(|i| (*i).clone())?
+            }
+            LoadBalanceStrategy::FastestResponse => {
+                (*healthy.iter()
+                    .min_by_key(|i| i.avg_response_time_ms)?).clone()
+            }
+        };
+
+        Some(selected)
+    }
+
+    /// Get all instances for a tool
+    pub fn get_instances(&self, tool: Tool) -> Vec<ToolInstance> {
+        let instances = self.instances.read();
+        instances.get(&tool).cloned().unwrap_or_default()
+    }
+
+    /// Get count of healthy instances
+    pub fn healthy_count(&self, tool: Tool) -> usize {
+        let instances = self.instances.read();
+        instances.get(&tool)
+            .map(|list| list.iter().filter(|i| i.healthy).count())
+            .unwrap_or(0)
+    }
+}
+
+// =============================================================================
+// Prometheus Metrics
+// =============================================================================
+
+/// Prometheus-style metric types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricType {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+/// A single metric value
+#[derive(Debug, Clone)]
+pub struct MetricValue {
+    pub name: String,
+    pub help: String,
+    pub metric_type: MetricType,
+    pub labels: HashMap<String, String>,
+    pub value: f64,
+}
+
+/// Prometheus metrics exporter
+pub struct PrometheusExporter {
+    prefix: String,
+}
+
+// =============================================================================
+// Distributed Tracing Support
+// =============================================================================
+
+/// Trace ID for distributed tracing (W3C Trace Context compatible)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TraceId(pub String);
+
+impl TraceId {
+    /// Generate a new random trace ID (128-bit hex string)
+    pub fn generate() -> Self {
+        let rng = ring::rand::SystemRandom::new();
+        let mut bytes = [0u8; 16];
+        ring::rand::SecureRandom::fill(&rng, &mut bytes).expect("Failed to generate trace ID");
+        Self(hex::encode(&bytes))
+    }
+
+    /// Create from existing hex string
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(Self(hex.to_string()))
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for TraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Span ID for distributed tracing
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SpanId(pub String);
+
+impl SpanId {
+    /// Generate a new random span ID (64-bit hex string)
+    pub fn generate() -> Self {
+        let rng = ring::rand::SystemRandom::new();
+        let mut bytes = [0u8; 8];
+        ring::rand::SecureRandom::fill(&rng, &mut bytes).expect("Failed to generate span ID");
+        Self(hex::encode(&bytes))
+    }
+}
+
+impl std::fmt::Display for SpanId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Trace context for propagation (W3C Trace Context format)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceContext {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub parent_span_id: Option<SpanId>,
+    pub sampled: bool,
+}
+
+impl TraceContext {
+    /// Create a new root trace context
+    pub fn new() -> Self {
+        Self {
+            trace_id: TraceId::generate(),
+            span_id: SpanId::generate(),
+            parent_span_id: None,
+            sampled: true,
+        }
+    }
+
+    /// Create a child span context
+    pub fn child(&self) -> Self {
+        Self {
+            trace_id: self.trace_id.clone(),
+            span_id: SpanId::generate(),
+            parent_span_id: Some(self.span_id.clone()),
+            sampled: self.sampled,
+        }
+    }
+
+    /// Format as W3C traceparent header
+    pub fn to_traceparent(&self) -> String {
+        let flags = if self.sampled { "01" } else { "00" };
+        format!("00-{}-{}-{}", self.trace_id.0, self.span_id.0, flags)
+    }
+
+    /// Parse from W3C traceparent header
+    pub fn from_traceparent(header: &str) -> Option<Self> {
+        let parts: Vec<&str> = header.split('-').collect();
+        if parts.len() != 4 || parts[0] != "00" {
+            return None;
+        }
+
+        let trace_id = TraceId::from_hex(parts[1])?;
+        let span_id = SpanId(parts[2].to_string());
+        let sampled = parts[3] == "01";
+
+        Some(Self {
+            trace_id,
+            span_id,
+            parent_span_id: None,
+            sampled,
+        })
+    }
+}
+
+impl Default for TraceContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A trace span representing a unit of work
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Span {
+    pub name: String,
+    pub context: TraceContext,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
+    pub attributes: HashMap<String, String>,
+    pub status: SpanStatus,
+}
+
+/// Status of a span
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanStatus {
+    Ok,
+    Error,
+    Unset,
+}
+
+impl Default for SpanStatus {
+    fn default() -> Self {
+        Self::Unset
+    }
+}
+
+impl Span {
+    /// Create a new span
+    pub fn new(name: &str, context: TraceContext) -> Self {
+        Self {
+            name: name.to_string(),
+            context,
+            start_time: Utc::now(),
+            end_time: None,
+            attributes: HashMap::new(),
+            status: SpanStatus::Unset,
+        }
+    }
+
+    /// Add an attribute to the span
+    pub fn with_attribute(mut self, key: &str, value: &str) -> Self {
+        self.attributes.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Set the span status
+    pub fn set_status(&mut self, status: SpanStatus) {
+        self.status = status;
+    }
+
+    /// End the span
+    pub fn end(&mut self) {
+        self.end_time = Some(Utc::now());
+    }
+
+    /// Get duration in milliseconds
+    pub fn duration_ms(&self) -> Option<i64> {
+        self.end_time.map(|end| (end - self.start_time).num_milliseconds())
+    }
+}
+
+/// Simple hex encoding (we already have base64, but traces use hex)
+mod hex {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
+    pub fn encode(bytes: &[u8]) -> String {
+        let mut result = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            result.push(HEX_CHARS[(byte >> 4) as usize] as char);
+            result.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
+        }
+        result
+    }
+}
+
+impl PrometheusExporter {
+    pub fn new(prefix: &str) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+        }
+    }
+
+    /// Format metrics in Prometheus exposition format
+    pub fn format(&self, metrics: &ServerMetrics) -> String {
+        let mut output = String::new();
+
+        // Active connections gauge
+        output.push_str(&format!(
+            "# HELP {}_active_connections Number of active connections\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_active_connections gauge\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_active_connections {}\n\n",
+            self.prefix, metrics.active_connections
+        ));
+
+        // Total requests counter
+        output.push_str(&format!(
+            "# HELP {}_requests_total Total number of requests\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_requests_total counter\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_requests_total {}\n\n",
+            self.prefix, metrics.total_requests
+        ));
+
+        // Requests per minute gauge
+        output.push_str(&format!(
+            "# HELP {}_requests_per_minute Current request rate\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_requests_per_minute gauge\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_requests_per_minute {:.2}\n\n",
+            self.prefix, metrics.requests_per_minute
+        ));
+
+        // Uptime gauge
+        output.push_str(&format!(
+            "# HELP {}_uptime_seconds Server uptime in seconds\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_uptime_seconds gauge\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_uptime_seconds {}\n\n",
+            self.prefix, metrics.uptime_seconds
+        ));
+
+        // Cache stats
+        output.push_str(&format!(
+            "# HELP {}_cache_hits Total cache hits\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_cache_hits counter\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_cache_hits {}\n\n",
+            self.prefix, metrics.cache_stats.hits
+        ));
+
+        output.push_str(&format!(
+            "# HELP {}_cache_misses Total cache misses\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_cache_misses counter\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_cache_misses {}\n\n",
+            self.prefix, metrics.cache_stats.misses
+        ));
+
+        // Tool-specific metrics
+        for tool_stat in &metrics.tool_stats {
+            let tool_name = tool_stat.tool.as_str().to_lowercase();
+
+            output.push_str(&format!(
+                "{}_tool_requests_total{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.total_requests
+            ));
+            output.push_str(&format!(
+                "{}_tool_successful_requests{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.successful_requests
+            ));
+            output.push_str(&format!(
+                "{}_tool_failed_requests{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.failed_requests
+            ));
+            output.push_str(&format!(
+                "{}_tool_avg_latency_ms{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.avg_latency_ms
+            ));
+            output.push_str(&format!(
+                "{}_tool_rate_limit_hits{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.rate_limit_hits
+            ));
+        }
+
+        output
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

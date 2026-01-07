@@ -34,7 +34,7 @@ use polyglot_common::{
     HealthChecker, HealthCheckConfig,
     MetricsCollector,
     ContextWindowManager, ContextWindowConfig,
-    Database, AuditLogEntry,
+    Database, AuditLogEntry, StoredSession,
 };
 
 #[derive(Parser, Debug)]
@@ -264,6 +264,52 @@ impl BridgeState {
                 warn!("Failed to log audit entry: {}", e);
             }
         }
+    }
+
+    /// Save a session to persistent storage
+    fn save_session(&self, session: &StoredSession) {
+        if let Some(ref db) = self.database {
+            if let Err(e) = db.save_session(session) {
+                warn!("Failed to save session: {}", e);
+            }
+        }
+    }
+
+    /// Load a session from persistent storage
+    fn load_session(&self, session_id: &str) -> Option<StoredSession> {
+        if let Some(ref db) = self.database {
+            match db.get_session(session_id) {
+                Ok(Some(session)) => return Some(session),
+                Ok(None) => return None,
+                Err(e) => {
+                    warn!("Failed to load session {}: {}", session_id, e);
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    /// Delete a session from persistent storage
+    fn delete_session(&self, session_id: &str) {
+        if let Some(ref db) = self.database {
+            if let Err(e) = db.delete_session(session_id) {
+                warn!("Failed to delete session {}: {}", session_id, e);
+            }
+        }
+    }
+
+    /// Cleanup expired sessions
+    fn cleanup_expired_sessions(&self) -> u64 {
+        if let Some(ref db) = self.database {
+            match db.cleanup_expired_sessions() {
+                Ok(count) => return count,
+                Err(e) => {
+                    warn!("Failed to cleanup sessions: {}", e);
+                }
+            }
+        }
+        0
     }
 
     fn check_rate_limit(&self, ip: &str) -> Result<(), ServerMessage> {
@@ -541,6 +587,19 @@ async fn main() -> Result<()> {
         loop {
             interval.tick().await;
             cleanup_state.rate_limiter.cleanup();
+        }
+    });
+
+    // Spawn background cleanup task for sessions
+    let session_cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600)); // Every hour
+        loop {
+            interval.tick().await;
+            let cleaned = session_cleanup_state.cleanup_expired_sessions();
+            if cleaned > 0 {
+                info!("Cleaned up {} expired sessions", cleaned);
+            }
         }
     });
 

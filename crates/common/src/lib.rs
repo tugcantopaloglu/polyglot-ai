@@ -37,6 +37,9 @@ pub use features::{
     ApiKeyManager, ApiKeyError,
     WebhookEvent, WebhookPayload, WebhookConfig, compute_webhook_signature,
     StreamConfig, StreamBuffer, StreamChunk,
+    LoadBalancer, LoadBalanceStrategy, ToolInstance,
+    PrometheusExporter, MetricType, MetricValue,
+    TraceId, SpanId, TraceContext, Span, SpanStatus,
 };
 
 pub use updater::{
