@@ -11,6 +11,7 @@ use tokio::io::{BufReader, AsyncBufReadExt};
 use tokio::sync::mpsc;
 use chrono::Utc;
 
+use polyglot_common::{PluginValidator, PluginValidationConfig};
 use crate::tools::ToolOutput;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,15 +125,27 @@ impl PluginUsage {
 pub struct PluginManager {
     plugins: HashMap<String, PluginConfig>,
     usage: HashMap<String, PluginUsage>,
+    validator: PluginValidator,
 }
 
 impl PluginManager {
     pub fn new(plugins: Vec<PluginConfig>) -> Self {
+        Self::with_validation(plugins, PluginValidationConfig::default())
+    }
+
+    pub fn with_validation(plugins: Vec<PluginConfig>, validation_config: PluginValidationConfig) -> Self {
+        let validator = PluginValidator::new(validation_config);
         let mut plugin_map = HashMap::new();
         let mut usage_map = HashMap::new();
 
         for plugin in plugins {
             if plugin.enabled {
+                // Validate plugin configuration
+                if let Err(e) = Self::validate_plugin(&validator, &plugin) {
+                    tracing::warn!("Plugin '{}' failed validation: {}", plugin.name, e);
+                    continue;
+                }
+
                 let name = plugin.name.clone();
                 usage_map.insert(name.clone(), PluginUsage::new(name.clone()));
                 plugin_map.insert(name, plugin);
@@ -142,7 +155,32 @@ impl PluginManager {
         Self {
             plugins: plugin_map,
             usage: usage_map,
+            validator,
         }
+    }
+
+    fn validate_plugin(validator: &PluginValidator, plugin: &PluginConfig) -> Result<()> {
+        // Validate command
+        validator.validate_command(&plugin.command)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Validate interpreter if script type
+        if plugin.plugin_type == PluginType::Script {
+            if let Some(ref interpreter) = plugin.interpreter {
+                validator.validate_interpreter(interpreter)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+            }
+        }
+
+        // Validate args
+        validator.validate_args(&plugin.args)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Validate timeout
+        validator.validate_timeout(plugin.timeout)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        Ok(())
     }
 
     pub fn list_plugins(&self) -> Vec<&PluginConfig> {
