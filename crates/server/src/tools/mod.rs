@@ -53,6 +53,7 @@ pub struct ToolRequest {
     pub message: String,
     pub working_dir: Option<String>,
     pub context_files: Vec<String>,
+    pub env: Vec<(String, String)>,
 }
 
 #[async_trait]

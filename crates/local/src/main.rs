@@ -11,6 +11,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
@@ -48,6 +49,10 @@ struct Cli {
 
     #[arg(short, long, global = true)]
     project: Option<PathBuf>,
+
+    /// Environment overrides (repeatable KEY=VALUE)
+    #[arg(long, global = true)]
+    env: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -85,6 +90,13 @@ enum Commands {
 
     Env,
 
+    DriveSync {
+        #[arg(long, default_value = "upload")]
+        direction: String,
+    },
+
+    DriveStatus,
+
     /// Check for updates and optionally install them
     Update {
         /// Just check for updates without installing
@@ -113,11 +125,13 @@ async fn main() -> Result<()> {
         .init();
 
     let config_path = cli.config.unwrap_or_else(LocalConfig::default_path);
-    let config = if config_path.exists() {
+    let mut config = if config_path.exists() {
         LocalConfig::load(&config_path)?
     } else {
         LocalConfig::default()
     };
+
+    apply_env_overrides(&mut config, &cli.env);
 
     let mut history_manager = HistoryManager::new(None)?;
     if let Some(ref project) = cli.project {
@@ -158,6 +172,12 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Env) => {
             show_environment(&tool_manager, &config)
+        }
+        Some(Commands::DriveSync { direction }) => {
+            run_drive_sync(&config, &direction).await
+        }
+        Some(Commands::DriveStatus) => {
+            show_drive_status(&config)
         }
         Some(Commands::Update { check_only, force }) => {
             run_update(check_only, force).await
@@ -1517,4 +1537,77 @@ async fn check_updates_on_startup() -> Option<String> {
         }
         _ => None,
     }
+}
+
+async fn run_drive_sync(config: &LocalConfig, direction: &str) -> Result<()> {
+    let remote = config.drive.remote.clone()
+        .ok_or_else(|| anyhow::anyhow!("Drive remote not configured in local.toml"))?;
+    let local_path = config.drive.path.to_string_lossy().to_string();
+
+    let (source, target) = match direction {
+        "download" => (remote.as_str(), local_path.as_str()),
+        _ => (local_path.as_str(), remote.as_str()),
+    };
+
+    println!("Starting Drive sync ({} -> {})", source, target);
+
+    let output = Command::new("rclone")
+        .arg("sync")
+        .arg(source)
+        .arg(target)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("rclone failed: {}", stderr.trim()));
+    }
+
+    println!("Drive sync complete.");
+    Ok(())
+}
+
+fn show_drive_status(config: &LocalConfig) -> Result<()> {
+    println!("Google Drive Sync");
+    println!("  Remote: {}", config.drive.remote.as_deref().unwrap_or("not set"));
+    println!("  Path:   {}", config.drive.path.to_string_lossy());
+    Ok(())
+}
+
+fn apply_env_overrides(config: &mut LocalConfig, overrides: &[String]) {
+    if overrides.is_empty() {
+        return;
+    }
+
+    let mut entries = Vec::new();
+    for item in overrides {
+        if let Some((key, value)) = item.split_once('=') {
+            let trimmed_key = key.trim();
+            if !trimmed_key.is_empty() {
+                entries.push((trimmed_key.to_string(), value.to_string()));
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return;
+    }
+
+    for (key, _) in &entries {
+        config.sandbox.env_whitelist.insert(key.clone());
+    }
+
+    let mut apply_to_tool = |tool: &mut Option<config::ToolConfig>| {
+        if let Some(ref mut tool_config) = tool {
+            tool_config.env.extend(entries.clone());
+        }
+    };
+
+    apply_to_tool(&mut config.tools.claude);
+    apply_to_tool(&mut config.tools.gemini);
+    apply_to_tool(&mut config.tools.codex);
+    apply_to_tool(&mut config.tools.copilot);
+    apply_to_tool(&mut config.tools.perplexity);
+    apply_to_tool(&mut config.tools.cursor);
+    apply_to_tool(&mut config.tools.ollama);
 }

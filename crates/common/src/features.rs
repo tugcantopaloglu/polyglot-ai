@@ -1,0 +1,2052 @@
+//! Feature utilities: rate limiting, caching, quotas, health checks, metrics
+
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+
+use crate::{Tool, ToolHealthInfo, ToolMetrics, CacheStats};
+
+// =============================================================================
+// Rate Limiting
+// =============================================================================
+
+/// Token bucket rate limiter for connection and request limiting
+pub struct RateLimiter {
+    buckets: RwLock<HashMap<String, TokenBucket>>,
+    config: RateLimitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    /// Maximum requests per window
+    pub max_requests: u32,
+    /// Window duration in seconds
+    pub window_seconds: u64,
+    /// Maximum connections per IP
+    pub max_connections_per_ip: u32,
+    /// Cleanup interval in seconds
+    pub cleanup_interval_seconds: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            max_requests: 100,
+            window_seconds: 60,
+            max_connections_per_ip: 10,
+            cleanup_interval_seconds: 300,
+        }
+    }
+}
+
+struct TokenBucket {
+    tokens: f64,
+    last_update: Instant,
+    max_tokens: f64,
+    refill_rate: f64,
+}
+
+impl TokenBucket {
+    fn new(max_tokens: u32, window_seconds: u64) -> Self {
+        let max = max_tokens as f64;
+        Self {
+            tokens: max,
+            last_update: Instant::now(),
+            max_tokens: max,
+            refill_rate: max / window_seconds as f64,
+        }
+    }
+
+    fn try_consume(&mut self, tokens: f64) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+        self.last_update = now;
+
+        if self.tokens >= tokens {
+            self.tokens -= tokens;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remaining(&self) -> u32 {
+        self.tokens as u32
+    }
+}
+
+impl RateLimiter {
+    pub fn new(config: RateLimitConfig) -> Self {
+        Self {
+            buckets: RwLock::new(HashMap::new()),
+            config,
+        }
+    }
+
+    /// Check if a request is allowed for the given key
+    pub fn check(&self, key: &str) -> RateLimitResult {
+        let mut buckets = self.buckets.write();
+        let bucket = buckets.entry(key.to_string()).or_insert_with(|| {
+            TokenBucket::new(self.config.max_requests, self.config.window_seconds)
+        });
+
+        if bucket.try_consume(1.0) {
+            RateLimitResult::Allowed {
+                remaining: bucket.remaining(),
+            }
+        } else {
+            RateLimitResult::Limited {
+                retry_after_seconds: self.config.window_seconds,
+            }
+        }
+    }
+
+    /// Check connection rate limit for an IP
+    pub fn check_connection(&self, ip: &str) -> RateLimitResult {
+        let key = format!("conn:{}", ip);
+        let mut buckets = self.buckets.write();
+        let bucket = buckets.entry(key).or_insert_with(|| {
+            TokenBucket::new(self.config.max_connections_per_ip, 60)
+        });
+
+        if bucket.try_consume(1.0) {
+            RateLimitResult::Allowed {
+                remaining: bucket.remaining(),
+            }
+        } else {
+            RateLimitResult::Limited {
+                retry_after_seconds: 60,
+            }
+        }
+    }
+
+    /// Clean up old buckets
+    pub fn cleanup(&self) {
+        let mut buckets = self.buckets.write();
+        let threshold = Instant::now() - Duration::from_secs(self.config.cleanup_interval_seconds);
+        buckets.retain(|_, b| b.last_update > threshold);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum RateLimitResult {
+    Allowed { remaining: u32 },
+    Limited { retry_after_seconds: u64 },
+}
+
+impl RateLimitResult {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, RateLimitResult::Allowed { .. })
+    }
+}
+
+// =============================================================================
+// Response Caching
+// =============================================================================
+
+/// LRU cache for caching prompt responses
+pub struct ResponseCache<K, V> {
+    entries: RwLock<HashMap<K, CacheEntry<V>>>,
+    config: CacheConfig,
+    stats: CacheStatsInternal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Maximum number of entries
+    pub max_entries: usize,
+    /// Entry TTL in seconds
+    pub ttl_seconds: u64,
+    /// Maximum memory in bytes (0 = unlimited)
+    pub max_memory_bytes: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 1000,
+            ttl_seconds: 3600,
+            max_memory_bytes: 100 * 1024 * 1024, // 100 MB
+        }
+    }
+}
+
+struct CacheEntry<V> {
+    value: V,
+    created_at: Instant,
+    last_accessed: Instant,
+    size_bytes: usize,
+}
+
+struct CacheStatsInternal {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    memory_bytes: AtomicU64,
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> ResponseCache<K, V> {
+    pub fn new(config: CacheConfig) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            config,
+            stats: CacheStatsInternal {
+                hits: AtomicU64::new(0),
+                misses: AtomicU64::new(0),
+                memory_bytes: AtomicU64::new(0),
+            },
+        }
+    }
+
+    pub fn get(&self, key: &K) -> Option<V> {
+        let mut entries = self.entries.write();
+        if let Some(entry) = entries.get_mut(key) {
+            let now = Instant::now();
+            if now.duration_since(entry.created_at).as_secs() < self.config.ttl_seconds {
+                entry.last_accessed = now;
+                self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                return Some(entry.value.clone());
+            } else {
+                // Expired
+                self.stats.memory_bytes.fetch_sub(entry.size_bytes as u64, Ordering::Relaxed);
+                entries.remove(key);
+            }
+        }
+        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    pub fn insert(&self, key: K, value: V, size_bytes: usize) {
+        let mut entries = self.entries.write();
+
+        // Evict if at capacity
+        let max_entries = self.config.max_entries;
+        while entries.len() >= max_entries {
+            if let Some(oldest_key) = find_lru_key(&entries) {
+                if let Some(entry) = entries.remove(&oldest_key) {
+                    self.stats.memory_bytes.fetch_sub(entry.size_bytes as u64, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+
+        let now = Instant::now();
+        entries.insert(key, CacheEntry {
+            value,
+            created_at: now,
+            last_accessed: now,
+            size_bytes,
+        });
+        self.stats.memory_bytes.fetch_add(size_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        let entries = self.entries.read();
+        let hits = self.stats.hits.load(Ordering::Relaxed);
+        let misses = self.stats.misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+
+        CacheStats {
+            entries: entries.len() as u64,
+            hits,
+            misses,
+            hit_rate: if total > 0 { hits as f32 / total as f32 } else { 0.0 },
+            memory_bytes: self.stats.memory_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn clear(&self) {
+        let mut entries = self.entries.write();
+        entries.clear();
+        self.stats.memory_bytes.store(0, Ordering::Relaxed);
+    }
+}
+
+fn find_lru_key<K: Eq + Hash + Clone, V>(entries: &HashMap<K, CacheEntry<V>>) -> Option<K> {
+    entries.iter()
+        .min_by_key(|(_, e)| e.last_accessed)
+        .map(|(k, _)| k.clone())
+}
+
+// =============================================================================
+// Usage Quotas
+// =============================================================================
+
+/// Usage quota tracker
+pub struct QuotaTracker {
+    quotas: RwLock<HashMap<String, UserQuota>>,
+    config: QuotaConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaConfig {
+    /// Daily request limit (None = unlimited)
+    pub daily_limit: Option<u64>,
+    /// Monthly request limit (None = unlimited)
+    pub monthly_limit: Option<u64>,
+    /// Daily token limit (None = unlimited)
+    pub daily_token_limit: Option<u64>,
+    /// Monthly token limit (None = unlimited)
+    pub monthly_token_limit: Option<u64>,
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            daily_limit: Some(1000),
+            monthly_limit: Some(10000),
+            daily_token_limit: Some(1_000_000),
+            monthly_token_limit: Some(10_000_000),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UserQuota {
+    daily_requests: u64,
+    monthly_requests: u64,
+    daily_tokens: u64,
+    monthly_tokens: u64,
+    daily_reset: DateTime<Utc>,
+    monthly_reset: DateTime<Utc>,
+}
+
+impl UserQuota {
+    fn new() -> Self {
+        let now = Utc::now();
+        Self {
+            daily_requests: 0,
+            monthly_requests: 0,
+            daily_tokens: 0,
+            monthly_tokens: 0,
+            daily_reset: now + chrono::Duration::days(1),
+            monthly_reset: now + chrono::Duration::days(30),
+        }
+    }
+
+    fn check_and_reset(&mut self) {
+        let now = Utc::now();
+        if now >= self.daily_reset {
+            self.daily_requests = 0;
+            self.daily_tokens = 0;
+            self.daily_reset = now + chrono::Duration::days(1);
+        }
+        if now >= self.monthly_reset {
+            self.monthly_requests = 0;
+            self.monthly_tokens = 0;
+            self.monthly_reset = now + chrono::Duration::days(30);
+        }
+    }
+}
+
+impl QuotaTracker {
+    pub fn new(config: QuotaConfig) -> Self {
+        Self {
+            quotas: RwLock::new(HashMap::new()),
+            config,
+        }
+    }
+
+    pub fn check(&self, user_id: &str) -> QuotaResult {
+        let mut quotas = self.quotas.write();
+        let quota = quotas.entry(user_id.to_string())
+            .or_insert_with(UserQuota::new);
+        quota.check_and_reset();
+
+        // Check daily limit
+        if let Some(limit) = self.config.daily_limit {
+            if quota.daily_requests >= limit {
+                return QuotaResult::Exceeded {
+                    reason: "Daily request limit exceeded".to_string(),
+                    reset_at: quota.daily_reset,
+                };
+            }
+        }
+
+        // Check monthly limit
+        if let Some(limit) = self.config.monthly_limit {
+            if quota.monthly_requests >= limit {
+                return QuotaResult::Exceeded {
+                    reason: "Monthly request limit exceeded".to_string(),
+                    reset_at: quota.monthly_reset,
+                };
+            }
+        }
+
+        QuotaResult::Allowed {
+            daily_remaining: self.config.daily_limit.map(|l| l.saturating_sub(quota.daily_requests)),
+            monthly_remaining: self.config.monthly_limit.map(|l| l.saturating_sub(quota.monthly_requests)),
+        }
+    }
+
+    pub fn record_usage(&self, user_id: &str, tokens: u64) {
+        let mut quotas = self.quotas.write();
+        let quota = quotas.entry(user_id.to_string())
+            .or_insert_with(UserQuota::new);
+        quota.check_and_reset();
+        quota.daily_requests += 1;
+        quota.monthly_requests += 1;
+        quota.daily_tokens += tokens;
+        quota.monthly_tokens += tokens;
+    }
+
+    pub fn get_status(&self, user_id: &str) -> QuotaStatus {
+        let mut quotas = self.quotas.write();
+        let quota = quotas.entry(user_id.to_string())
+            .or_insert_with(UserQuota::new);
+        quota.check_and_reset();
+
+        QuotaStatus {
+            daily_limit: self.config.daily_limit,
+            daily_used: quota.daily_requests,
+            monthly_limit: self.config.monthly_limit,
+            monthly_used: quota.monthly_requests,
+            daily_reset: quota.daily_reset,
+            monthly_reset: quota.monthly_reset,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum QuotaResult {
+    Allowed {
+        daily_remaining: Option<u64>,
+        monthly_remaining: Option<u64>,
+    },
+    Exceeded {
+        reason: String,
+        reset_at: DateTime<Utc>,
+    },
+}
+
+impl QuotaResult {
+    pub fn is_allowed(&self) -> bool {
+        matches!(self, QuotaResult::Allowed { .. })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaStatus {
+    pub daily_limit: Option<u64>,
+    pub daily_used: u64,
+    pub monthly_limit: Option<u64>,
+    pub monthly_used: u64,
+    pub daily_reset: DateTime<Utc>,
+    pub monthly_reset: DateTime<Utc>,
+}
+
+// =============================================================================
+// Health Checks
+// =============================================================================
+
+/// Tool health checker
+pub struct HealthChecker {
+    health: RwLock<HashMap<Tool, HealthState>>,
+    config: HealthCheckConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheckConfig {
+    /// Check interval in seconds
+    pub check_interval_seconds: u64,
+    /// Failure threshold before marking unhealthy
+    pub failure_threshold: u32,
+    /// Recovery threshold to mark healthy again
+    pub recovery_threshold: u32,
+    /// Timeout for health check in milliseconds
+    pub timeout_ms: u64,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            check_interval_seconds: 60,
+            failure_threshold: 3,
+            recovery_threshold: 2,
+            timeout_ms: 5000,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HealthState {
+    healthy: bool,
+    last_check: DateTime<Utc>,
+    latency_ms: Option<u32>,
+    consecutive_failures: u32,
+    consecutive_successes: u32,
+    total_checks: u64,
+    failed_checks: u64,
+}
+
+impl Default for HealthState {
+    fn default() -> Self {
+        Self {
+            healthy: true,
+            last_check: Utc::now(),
+            latency_ms: None,
+            consecutive_failures: 0,
+            consecutive_successes: 0,
+            total_checks: 0,
+            failed_checks: 0,
+        }
+    }
+}
+
+impl HealthChecker {
+    pub fn new(config: HealthCheckConfig) -> Self {
+        let mut health = HashMap::new();
+        for tool in Tool::all() {
+            health.insert(*tool, HealthState::default());
+        }
+        Self {
+            health: RwLock::new(health),
+            config,
+        }
+    }
+
+    pub fn record_success(&self, tool: Tool, latency_ms: u32) {
+        let mut health = self.health.write();
+        if let Some(state) = health.get_mut(&tool) {
+            state.last_check = Utc::now();
+            state.latency_ms = Some(latency_ms);
+            state.consecutive_failures = 0;
+            state.consecutive_successes += 1;
+            state.total_checks += 1;
+
+            if !state.healthy && state.consecutive_successes >= self.config.recovery_threshold {
+                state.healthy = true;
+            }
+        }
+    }
+
+    pub fn record_failure(&self, tool: Tool) {
+        let mut health = self.health.write();
+        if let Some(state) = health.get_mut(&tool) {
+            state.last_check = Utc::now();
+            state.consecutive_successes = 0;
+            state.consecutive_failures += 1;
+            state.total_checks += 1;
+            state.failed_checks += 1;
+
+            if state.healthy && state.consecutive_failures >= self.config.failure_threshold {
+                state.healthy = false;
+            }
+        }
+    }
+
+    pub fn is_healthy(&self, tool: Tool) -> bool {
+        let health = self.health.read();
+        health.get(&tool).map(|s| s.healthy).unwrap_or(false)
+    }
+
+    pub fn get_status(&self) -> Vec<ToolHealthInfo> {
+        let health = self.health.read();
+        health.iter().map(|(tool, state)| {
+            let error_rate = if state.total_checks > 0 {
+                state.failed_checks as f32 / state.total_checks as f32
+            } else {
+                0.0
+            };
+            ToolHealthInfo {
+                tool: *tool,
+                healthy: state.healthy,
+                last_check: state.last_check,
+                latency_ms: state.latency_ms,
+                error_rate,
+                consecutive_failures: state.consecutive_failures,
+            }
+        }).collect()
+    }
+
+    pub fn all_healthy(&self) -> bool {
+        let health = self.health.read();
+        health.values().all(|s| s.healthy)
+    }
+
+    /// Get a list of healthy tools, ordered by latency (best first)
+    pub fn get_healthy_tools(&self) -> Vec<Tool> {
+        let health = self.health.read();
+        let mut healthy: Vec<_> = health.iter()
+            .filter(|(_, state)| state.healthy)
+            .map(|(tool, state)| (*tool, state.latency_ms.unwrap_or(u32::MAX)))
+            .collect();
+        healthy.sort_by_key(|(_, latency)| *latency);
+        healthy.into_iter().map(|(tool, _)| tool).collect()
+    }
+
+    /// Get a fallback tool if the requested tool is unhealthy
+    /// Returns the requested tool if healthy, otherwise the best healthy alternative
+    pub fn get_tool_with_fallback(&self, requested: Tool, allowed_tools: &[Tool]) -> Option<Tool> {
+        if self.is_healthy(requested) {
+            return Some(requested);
+        }
+
+        // Find the best healthy alternative from allowed tools
+        let healthy_tools = self.get_healthy_tools();
+        for tool in healthy_tools {
+            if allowed_tools.contains(&tool) {
+                return Some(tool);
+            }
+        }
+
+        // If no healthy alternative, return the requested tool anyway
+        Some(requested)
+    }
+
+    /// Get priority-ordered failover chain for a tool
+    pub fn get_failover_chain(&self, primary: Tool, allowed: &[Tool]) -> Vec<Tool> {
+        let mut chain = Vec::with_capacity(allowed.len());
+
+        // Add primary first if healthy
+        if self.is_healthy(primary) {
+            chain.push(primary);
+        }
+
+        // Add other healthy tools by latency
+        let healthy = self.get_healthy_tools();
+        for tool in healthy {
+            if tool != primary && allowed.contains(&tool) && !chain.contains(&tool) {
+                chain.push(tool);
+            }
+        }
+
+        // Add primary at the end if not already added
+        if !chain.contains(&primary) {
+            chain.push(primary);
+        }
+
+        chain
+    }
+}
+
+// =============================================================================
+// Metrics Collection
+// =============================================================================
+
+/// Server metrics collector
+pub struct MetricsCollector {
+    tool_metrics: RwLock<HashMap<Tool, ToolMetricsInternal>>,
+    request_times: RwLock<Vec<Instant>>,
+    active_connections: AtomicU64,
+    total_requests: AtomicU64,
+    start_time: Instant,
+}
+
+struct ToolMetricsInternal {
+    total_requests: u64,
+    successful_requests: u64,
+    failed_requests: u64,
+    total_latency_ms: u64,
+    rate_limit_hits: u64,
+}
+
+impl Default for ToolMetricsInternal {
+    fn default() -> Self {
+        Self {
+            total_requests: 0,
+            successful_requests: 0,
+            failed_requests: 0,
+            total_latency_ms: 0,
+            rate_limit_hits: 0,
+        }
+    }
+}
+
+impl MetricsCollector {
+    pub fn new() -> Self {
+        let mut tool_metrics = HashMap::new();
+        for tool in Tool::all() {
+            tool_metrics.insert(*tool, ToolMetricsInternal::default());
+        }
+        Self {
+            tool_metrics: RwLock::new(tool_metrics),
+            request_times: RwLock::new(Vec::new()),
+            active_connections: AtomicU64::new(0),
+            total_requests: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn record_request(&self, tool: Tool, success: bool, latency_ms: u32) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        let mut metrics = self.tool_metrics.write();
+        if let Some(m) = metrics.get_mut(&tool) {
+            m.total_requests += 1;
+            m.total_latency_ms += latency_ms as u64;
+            if success {
+                m.successful_requests += 1;
+            } else {
+                m.failed_requests += 1;
+            }
+        }
+
+        let mut times = self.request_times.write();
+        times.push(Instant::now());
+        // Keep only last 5 minutes of requests
+        let cutoff = Instant::now() - Duration::from_secs(300);
+        times.retain(|t| *t > cutoff);
+    }
+
+    pub fn record_rate_limit(&self, tool: Tool) {
+        let mut metrics = self.tool_metrics.write();
+        if let Some(m) = metrics.get_mut(&tool) {
+            m.rate_limit_hits += 1;
+        }
+    }
+
+    pub fn connection_opened(&self) {
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn connection_closed(&self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn get_metrics(&self, cache_stats: CacheStats) -> ServerMetrics {
+        let metrics = self.tool_metrics.read();
+        let times = self.request_times.read();
+
+        let requests_per_minute = if times.is_empty() {
+            0.0
+        } else {
+            let now = Instant::now();
+            let one_minute_ago = now - Duration::from_secs(60);
+            let recent = times.iter().filter(|t| **t > one_minute_ago).count();
+            recent as f64
+        };
+
+        let tool_stats: Vec<ToolMetrics> = metrics.iter().map(|(tool, m)| {
+            ToolMetrics {
+                tool: *tool,
+                total_requests: m.total_requests,
+                successful_requests: m.successful_requests,
+                failed_requests: m.failed_requests,
+                avg_latency_ms: if m.total_requests > 0 {
+                    (m.total_latency_ms / m.total_requests) as u32
+                } else {
+                    0
+                },
+                rate_limit_hits: m.rate_limit_hits,
+            }
+        }).collect();
+
+        ServerMetrics {
+            active_connections: self.active_connections.load(Ordering::Relaxed) as u32,
+            total_requests: self.total_requests.load(Ordering::Relaxed),
+            requests_per_minute,
+            tool_stats,
+            cache_stats,
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+        }
+    }
+}
+
+impl Default for MetricsCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerMetrics {
+    pub active_connections: u32,
+    pub total_requests: u64,
+    pub requests_per_minute: f64,
+    pub tool_stats: Vec<ToolMetrics>,
+    pub cache_stats: CacheStats,
+    pub uptime_seconds: u64,
+}
+
+// =============================================================================
+// Context Window Management
+// =============================================================================
+
+/// Context window manager for handling token limits
+pub struct ContextWindowManager {
+    config: ContextWindowConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextWindowConfig {
+    /// Maximum tokens per request
+    pub max_tokens: u32,
+    /// Reserve tokens for response
+    pub response_reserve: u32,
+    /// Token estimation method
+    pub estimation_method: TokenEstimationMethod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEstimationMethod {
+    /// Approximate: chars / 4
+    CharDivide4,
+    /// Approximate: words * 1.3
+    WordMultiply,
+    /// More accurate but slower
+    Tiktoken,
+}
+
+impl Default for ContextWindowConfig {
+    fn default() -> Self {
+        Self {
+            max_tokens: 128000,
+            response_reserve: 4000,
+            estimation_method: TokenEstimationMethod::CharDivide4,
+        }
+    }
+}
+
+impl ContextWindowManager {
+    pub fn new(config: ContextWindowConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn estimate_tokens(&self, text: &str) -> u32 {
+        match self.config.estimation_method {
+            TokenEstimationMethod::CharDivide4 => (text.len() / 4) as u32,
+            TokenEstimationMethod::WordMultiply => {
+                let words = text.split_whitespace().count();
+                (words as f64 * 1.3) as u32
+            }
+            TokenEstimationMethod::Tiktoken => {
+                // Fallback to char/4 - tiktoken requires external lib
+                (text.len() / 4) as u32
+            }
+        }
+    }
+
+    pub fn available_tokens(&self) -> u32 {
+        self.config.max_tokens.saturating_sub(self.config.response_reserve)
+    }
+
+    pub fn fits(&self, text: &str) -> bool {
+        self.estimate_tokens(text) <= self.available_tokens()
+    }
+
+    pub fn truncate_to_fit(&self, text: &str) -> String {
+        let available = self.available_tokens();
+        let estimated = self.estimate_tokens(text);
+
+        if estimated <= available {
+            return text.to_string();
+        }
+
+        // Calculate approximate character limit
+        let ratio = available as f64 / estimated as f64;
+        let char_limit = (text.len() as f64 * ratio * 0.95) as usize; // 5% safety margin
+
+        crate::truncate_smart(text, char_limit)
+    }
+
+    pub fn validate_prompt(&self, prompt: &str) -> PromptValidation {
+        let tokens = self.estimate_tokens(prompt);
+        let max = self.config.max_tokens;
+
+        if tokens > max {
+            PromptValidation::TooLong {
+                tokens,
+                max_tokens: max,
+                excess: tokens - max,
+            }
+        } else if tokens > max * 90 / 100 {
+            PromptValidation::Warning {
+                tokens,
+                max_tokens: max,
+                usage_percent: (tokens as f64 / max as f64 * 100.0) as u8,
+            }
+        } else {
+            PromptValidation::Valid {
+                tokens,
+                remaining: max - tokens,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PromptValidation {
+    Valid { tokens: u32, remaining: u32 },
+    Warning { tokens: u32, max_tokens: u32, usage_percent: u8 },
+    TooLong { tokens: u32, max_tokens: u32, excess: u32 },
+}
+
+impl PromptValidation {
+    pub fn is_valid(&self) -> bool {
+        !matches!(self, PromptValidation::TooLong { .. })
+    }
+}
+
+// =============================================================================
+// Plugin Validation
+// =============================================================================
+
+/// Plugin configuration validator
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginValidationConfig {
+    /// Maximum command length
+    pub max_command_length: usize,
+    /// Maximum number of arguments
+    pub max_args: usize,
+    /// Allowed interpreters
+    pub allowed_interpreters: Vec<String>,
+    /// Maximum timeout in seconds
+    pub max_timeout_seconds: u64,
+    /// Forbidden command patterns
+    pub forbidden_patterns: Vec<String>,
+}
+
+impl Default for PluginValidationConfig {
+    fn default() -> Self {
+        Self {
+            max_command_length: 1024,
+            max_args: 50,
+            allowed_interpreters: vec![
+                "python".to_string(),
+                "python3".to_string(),
+                "node".to_string(),
+                "bash".to_string(),
+                "sh".to_string(),
+                "powershell".to_string(),
+            ],
+            max_timeout_seconds: 300,
+            forbidden_patterns: vec![
+                "rm -rf".to_string(),
+                "sudo".to_string(),
+                "chmod 777".to_string(),
+                "curl | sh".to_string(),
+                "wget | sh".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginValidator {
+    config: PluginValidationConfig,
+}
+
+impl PluginValidator {
+    pub fn new(config: PluginValidationConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn validate_command(&self, command: &str) -> Result<(), PluginValidationError> {
+        if command.len() > self.config.max_command_length {
+            return Err(PluginValidationError::CommandTooLong {
+                length: command.len(),
+                max: self.config.max_command_length,
+            });
+        }
+
+        let lower = command.to_lowercase();
+        for pattern in &self.config.forbidden_patterns {
+            if lower.contains(&pattern.to_lowercase()) {
+                return Err(PluginValidationError::ForbiddenPattern {
+                    pattern: pattern.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_interpreter(&self, interpreter: &str) -> Result<(), PluginValidationError> {
+        let name = std::path::Path::new(interpreter)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(interpreter);
+
+        if !self.config.allowed_interpreters.iter().any(|i| i == name) {
+            return Err(PluginValidationError::DisallowedInterpreter {
+                interpreter: interpreter.to_string(),
+                allowed: self.config.allowed_interpreters.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_args(&self, args: &[String]) -> Result<(), PluginValidationError> {
+        if args.len() > self.config.max_args {
+            return Err(PluginValidationError::TooManyArgs {
+                count: args.len(),
+                max: self.config.max_args,
+            });
+        }
+
+        // Check for injection patterns in args
+        for arg in args {
+            if arg.contains('`') || arg.contains("$(") || arg.contains('\0') {
+                return Err(PluginValidationError::SuspiciousArg {
+                    arg: arg.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_timeout(&self, timeout_seconds: u64) -> Result<(), PluginValidationError> {
+        if timeout_seconds > self.config.max_timeout_seconds {
+            return Err(PluginValidationError::TimeoutTooLong {
+                timeout: timeout_seconds,
+                max: self.config.max_timeout_seconds,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PluginValidationError {
+    CommandTooLong { length: usize, max: usize },
+    ForbiddenPattern { pattern: String },
+    DisallowedInterpreter { interpreter: String, allowed: Vec<String> },
+    TooManyArgs { count: usize, max: usize },
+    SuspiciousArg { arg: String },
+    TimeoutTooLong { timeout: u64, max: u64 },
+}
+
+impl std::fmt::Display for PluginValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CommandTooLong { length, max } => {
+                write!(f, "Command too long: {} chars (max {})", length, max)
+            }
+            Self::ForbiddenPattern { pattern } => {
+                write!(f, "Forbidden pattern detected: {}", pattern)
+            }
+            Self::DisallowedInterpreter { interpreter, allowed } => {
+                write!(f, "Interpreter '{}' not allowed. Allowed: {:?}", interpreter, allowed)
+            }
+            Self::TooManyArgs { count, max } => {
+                write!(f, "Too many arguments: {} (max {})", count, max)
+            }
+            Self::SuspiciousArg { arg } => {
+                write!(f, "Suspicious argument detected: {}", arg)
+            }
+            Self::TimeoutTooLong { timeout, max } => {
+                write!(f, "Timeout too long: {}s (max {}s)", timeout, max)
+            }
+        }
+    }
+}
+
+impl std::error::Error for PluginValidationError {}
+
+// =============================================================================
+// API Key Encryption
+// =============================================================================
+
+/// Encrypted API key manager
+pub struct ApiKeyManager {
+    encryption_key: [u8; 32],
+}
+
+impl ApiKeyManager {
+    /// Create a new manager with a derived key from password
+    pub fn new(password: &str) -> Self {
+        let mut key = [0u8; 32];
+        // Use PBKDF2 to derive key from password
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(100_000).unwrap(),
+            b"polyglot-ai-salt", // In production, use unique salt per installation
+            password.as_bytes(),
+            &mut key,
+        );
+        Self { encryption_key: key }
+    }
+
+    /// Create a manager with a raw 32-byte key
+    pub fn from_key(key: [u8; 32]) -> Self {
+        Self { encryption_key: key }
+    }
+
+    /// Generate a random encryption key
+    pub fn generate_key() -> [u8; 32] {
+        let rng = ring::rand::SystemRandom::new();
+        let mut key = [0u8; 32];
+        ring::rand::SecureRandom::fill(&rng, &mut key).expect("Failed to generate random key");
+        key
+    }
+
+    /// Encrypt an API key
+    pub fn encrypt(&self, api_key: &str) -> Result<Vec<u8>, ApiKeyError> {
+        let rng = ring::rand::SystemRandom::new();
+
+        // Generate a random 12-byte nonce
+        let mut nonce = [0u8; 12];
+        ring::rand::SecureRandom::fill(&rng, &mut nonce)
+            .map_err(|_| ApiKeyError::EncryptionFailed("Failed to generate nonce".to_string()))?;
+
+        // Create the sealing key
+        let unbound_key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &self.encryption_key)
+            .map_err(|_| ApiKeyError::EncryptionFailed("Invalid encryption key".to_string()))?;
+        let sealing_key = ring::aead::LessSafeKey::new(unbound_key);
+
+        // Encrypt the data
+        let mut in_out = api_key.as_bytes().to_vec();
+        sealing_key
+            .seal_in_place_append_tag(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::empty(),
+                &mut in_out,
+            )
+            .map_err(|_| ApiKeyError::EncryptionFailed("Encryption failed".to_string()))?;
+
+        // Prepend nonce to encrypted data
+        let mut result = nonce.to_vec();
+        result.extend(in_out);
+        Ok(result)
+    }
+
+    /// Decrypt an API key
+    pub fn decrypt(&self, encrypted: &[u8]) -> Result<String, ApiKeyError> {
+        if encrypted.len() < 13 {
+            return Err(ApiKeyError::DecryptionFailed("Data too short".to_string()));
+        }
+
+        // Extract nonce and ciphertext
+        let nonce: [u8; 12] = encrypted[..12].try_into()
+            .map_err(|_| ApiKeyError::DecryptionFailed("Invalid nonce".to_string()))?;
+        let mut ciphertext = encrypted[12..].to_vec();
+
+        // Create the opening key
+        let unbound_key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &self.encryption_key)
+            .map_err(|_| ApiKeyError::DecryptionFailed("Invalid encryption key".to_string()))?;
+        let opening_key = ring::aead::LessSafeKey::new(unbound_key);
+
+        // Decrypt the data
+        let plaintext = opening_key
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::empty(),
+                &mut ciphertext,
+            )
+            .map_err(|_| ApiKeyError::DecryptionFailed("Decryption failed".to_string()))?;
+
+        String::from_utf8(plaintext.to_vec())
+            .map_err(|_| ApiKeyError::DecryptionFailed("Invalid UTF-8".to_string()))
+    }
+
+    /// Validate that an API key looks reasonable (basic format check)
+    pub fn validate_key_format(api_key: &str) -> Result<(), ApiKeyError> {
+        if api_key.is_empty() {
+            return Err(ApiKeyError::InvalidFormat("API key is empty".to_string()));
+        }
+        if api_key.len() < 10 {
+            return Err(ApiKeyError::InvalidFormat("API key too short".to_string()));
+        }
+        if api_key.len() > 500 {
+            return Err(ApiKeyError::InvalidFormat("API key too long".to_string()));
+        }
+        // Check for common API key patterns
+        let has_valid_chars = api_key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+        if !has_valid_chars {
+            return Err(ApiKeyError::InvalidFormat("API key contains invalid characters".to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ApiKeyError {
+    EncryptionFailed(String),
+    DecryptionFailed(String),
+    InvalidFormat(String),
+}
+
+impl std::fmt::Display for ApiKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EncryptionFailed(msg) => write!(f, "Encryption failed: {}", msg),
+            Self::DecryptionFailed(msg) => write!(f, "Decryption failed: {}", msg),
+            Self::InvalidFormat(msg) => write!(f, "Invalid API key format: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ApiKeyError {}
+
+// =============================================================================
+// Webhook Notifier
+// =============================================================================
+
+/// Event types for webhook notifications
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookEvent {
+    RequestCompleted,
+    RequestFailed,
+    RateLimited,
+    QuotaExceeded,
+    ToolHealthChanged,
+    UserConnected,
+    UserDisconnected,
+}
+
+impl WebhookEvent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RequestCompleted => "request_completed",
+            Self::RequestFailed => "request_failed",
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::ToolHealthChanged => "tool_health_changed",
+            Self::UserConnected => "user_connected",
+            Self::UserDisconnected => "user_disconnected",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "request_completed" => Some(Self::RequestCompleted),
+            "request_failed" => Some(Self::RequestFailed),
+            "rate_limited" => Some(Self::RateLimited),
+            "quota_exceeded" => Some(Self::QuotaExceeded),
+            "tool_health_changed" => Some(Self::ToolHealthChanged),
+            "user_connected" => Some(Self::UserConnected),
+            "user_disconnected" => Some(Self::UserDisconnected),
+            _ => None,
+        }
+    }
+}
+
+/// Webhook payload sent to configured endpoints
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookPayload {
+    pub event: String,
+    pub timestamp: DateTime<Utc>,
+    pub data: serde_json::Value,
+}
+
+impl WebhookPayload {
+    pub fn new(event: WebhookEvent, data: serde_json::Value) -> Self {
+        Self {
+            event: event.as_str().to_string(),
+            timestamp: Utc::now(),
+            data,
+        }
+    }
+}
+
+/// Configuration for a webhook endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    pub url: String,
+    pub events: Vec<WebhookEvent>,
+    pub secret: Option<String>,
+    pub timeout_ms: u64,
+    pub max_retries: u32,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            events: vec![WebhookEvent::RequestFailed, WebhookEvent::ToolHealthChanged],
+            secret: None,
+            timeout_ms: 5000,
+            max_retries: 3,
+        }
+    }
+}
+
+/// Compute HMAC signature for webhook payload
+pub fn compute_webhook_signature(payload: &str, secret: &str) -> String {
+    use ring::hmac;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    let signature = hmac::sign(&key, payload.as_bytes());
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.as_ref())
+}
+
+// =============================================================================
+// Response Streaming
+// =============================================================================
+
+/// Streaming configuration for responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamConfig {
+    /// Minimum chunk size in bytes
+    pub min_chunk_size: usize,
+    /// Maximum chunk size in bytes
+    pub max_chunk_size: usize,
+    /// Flush interval in milliseconds
+    pub flush_interval_ms: u64,
+    /// Enable backpressure handling
+    pub backpressure_enabled: bool,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            min_chunk_size: 10,
+            max_chunk_size: 4096,
+            flush_interval_ms: 100,
+            backpressure_enabled: true,
+        }
+    }
+}
+
+/// Stream buffer for accumulating and chunking response data
+pub struct StreamBuffer {
+    buffer: String,
+    sequence: u32,
+    config: StreamConfig,
+    last_flush: Instant,
+}
+
+impl StreamBuffer {
+    pub fn new(config: StreamConfig) -> Self {
+        Self {
+            buffer: String::new(),
+            sequence: 0,
+            config,
+            last_flush: Instant::now(),
+        }
+    }
+
+    /// Add data to the buffer
+    pub fn push(&mut self, data: &str) {
+        self.buffer.push_str(data);
+    }
+
+    /// Check if the buffer should be flushed
+    pub fn should_flush(&self) -> bool {
+        self.buffer.len() >= self.config.min_chunk_size
+            || self.last_flush.elapsed().as_millis() as u64 >= self.config.flush_interval_ms
+    }
+
+    /// Flush the buffer and return chunks
+    pub fn flush(&mut self) -> Vec<StreamChunk> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+
+        let mut chunks = Vec::new();
+        while !self.buffer.is_empty() {
+            let chunk_size = self.buffer.len().min(self.config.max_chunk_size);
+
+            // Try to break at word boundary
+            let actual_size = if chunk_size < self.buffer.len() {
+                self.buffer[..chunk_size]
+                    .rfind(|c: char| c.is_whitespace())
+                    .map(|pos| pos + 1)
+                    .unwrap_or(chunk_size)
+            } else {
+                chunk_size
+            };
+
+            let content: String = self.buffer.drain(..actual_size).collect();
+            chunks.push(StreamChunk {
+                content,
+                sequence: self.sequence,
+                is_final: false,
+            });
+            self.sequence += 1;
+        }
+
+        self.last_flush = Instant::now();
+        chunks
+    }
+
+    /// Finalize the stream and return any remaining data
+    pub fn finalize(&mut self) -> Vec<StreamChunk> {
+        let mut chunks = self.flush();
+
+        // Add final marker
+        chunks.push(StreamChunk {
+            content: String::new(),
+            sequence: self.sequence,
+            is_final: true,
+        });
+
+        chunks
+    }
+
+    /// Get current sequence number
+    pub fn sequence(&self) -> u32 {
+        self.sequence
+    }
+}
+
+/// A chunk of streamed response data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamChunk {
+    pub content: String,
+    pub sequence: u32,
+    pub is_final: bool,
+}
+
+// =============================================================================
+// Load Balancing
+// =============================================================================
+
+/// Load balancing strategy for distributing requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalanceStrategy {
+    /// Round-robin distribution
+    RoundRobin,
+    /// Least connections (prefer instances with fewer active requests)
+    LeastConnections,
+    /// Weighted distribution based on instance capacity
+    Weighted,
+    /// Random selection
+    Random,
+    /// Fastest response time
+    FastestResponse,
+}
+
+impl Default for LoadBalanceStrategy {
+    fn default() -> Self {
+        Self::RoundRobin
+    }
+}
+
+/// A tool instance for load balancing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInstance {
+    pub id: String,
+    pub tool: Tool,
+    pub endpoint: String,
+    pub weight: u32,
+    pub healthy: bool,
+    pub active_connections: u32,
+    pub avg_response_time_ms: u32,
+}
+
+/// Load balancer for distributing requests across tool instances
+pub struct LoadBalancer {
+    instances: RwLock<HashMap<Tool, Vec<ToolInstance>>>,
+    strategy: LoadBalanceStrategy,
+    round_robin_index: RwLock<HashMap<Tool, usize>>,
+}
+
+impl LoadBalancer {
+    pub fn new(strategy: LoadBalanceStrategy) -> Self {
+        Self {
+            instances: RwLock::new(HashMap::new()),
+            strategy,
+            round_robin_index: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register a tool instance
+    pub fn register(&self, instance: ToolInstance) {
+        let mut instances = self.instances.write();
+        instances.entry(instance.tool)
+            .or_insert_with(Vec::new)
+            .push(instance);
+    }
+
+    /// Unregister a tool instance
+    pub fn unregister(&self, tool: Tool, instance_id: &str) {
+        let mut instances = self.instances.write();
+        if let Some(list) = instances.get_mut(&tool) {
+            list.retain(|i| i.id != instance_id);
+        }
+    }
+
+    /// Update instance health status
+    pub fn set_health(&self, tool: Tool, instance_id: &str, healthy: bool) {
+        let mut instances = self.instances.write();
+        if let Some(list) = instances.get_mut(&tool) {
+            if let Some(instance) = list.iter_mut().find(|i| i.id == instance_id) {
+                instance.healthy = healthy;
+            }
+        }
+    }
+
+    /// Update instance metrics
+    pub fn update_metrics(&self, tool: Tool, instance_id: &str, active: i32, response_time: Option<u32>) {
+        let mut instances = self.instances.write();
+        if let Some(list) = instances.get_mut(&tool) {
+            if let Some(instance) = list.iter_mut().find(|i| i.id == instance_id) {
+                instance.active_connections = (instance.active_connections as i32 + active).max(0) as u32;
+                if let Some(time) = response_time {
+                    // Exponential moving average
+                    instance.avg_response_time_ms =
+                        (instance.avg_response_time_ms * 7 + time * 3) / 10;
+                }
+            }
+        }
+    }
+
+    /// Select the best instance for a tool based on strategy
+    pub fn select(&self, tool: Tool) -> Option<ToolInstance> {
+        let instances = self.instances.read();
+        let list = instances.get(&tool)?;
+        let healthy: Vec<_> = list.iter().filter(|i| i.healthy).collect();
+
+        if healthy.is_empty() {
+            return None;
+        }
+
+        let selected = match self.strategy {
+            LoadBalanceStrategy::RoundRobin => {
+                let mut index = self.round_robin_index.write();
+                let idx = index.entry(tool).or_insert(0);
+                let instance = healthy.get(*idx % healthy.len())?;
+                *idx = (*idx + 1) % healthy.len();
+                (*instance).clone()
+            }
+            LoadBalanceStrategy::LeastConnections => {
+                (*healthy.iter()
+                    .min_by_key(|i| i.active_connections)?).clone()
+            }
+            LoadBalanceStrategy::Weighted => {
+                let total_weight: u32 = healthy.iter().map(|i| i.weight).sum();
+                if total_weight == 0 {
+                    return healthy.first().map(|i| (*i).clone());
+                }
+                let mut rng_val = (Instant::now().elapsed().as_nanos() as u32) % total_weight;
+                for instance in &healthy {
+                    if rng_val < instance.weight {
+                        return Some((*instance).clone());
+                    }
+                    rng_val -= instance.weight;
+                }
+                healthy.first().map(|i| (*i).clone())?
+            }
+            LoadBalanceStrategy::Random => {
+                let idx = (Instant::now().elapsed().as_nanos() as usize) % healthy.len();
+                healthy.get(idx).map(|i| (*i).clone())?
+            }
+            LoadBalanceStrategy::FastestResponse => {
+                (*healthy.iter()
+                    .min_by_key(|i| i.avg_response_time_ms)?).clone()
+            }
+        };
+
+        Some(selected)
+    }
+
+    /// Get all instances for a tool
+    pub fn get_instances(&self, tool: Tool) -> Vec<ToolInstance> {
+        let instances = self.instances.read();
+        instances.get(&tool).cloned().unwrap_or_default()
+    }
+
+    /// Get count of healthy instances
+    pub fn healthy_count(&self, tool: Tool) -> usize {
+        let instances = self.instances.read();
+        instances.get(&tool)
+            .map(|list| list.iter().filter(|i| i.healthy).count())
+            .unwrap_or(0)
+    }
+}
+
+// =============================================================================
+// Prometheus Metrics
+// =============================================================================
+
+/// Prometheus-style metric types
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricType {
+    Counter,
+    Gauge,
+    Histogram,
+}
+
+/// A single metric value
+#[derive(Debug, Clone)]
+pub struct MetricValue {
+    pub name: String,
+    pub help: String,
+    pub metric_type: MetricType,
+    pub labels: HashMap<String, String>,
+    pub value: f64,
+}
+
+/// Prometheus metrics exporter
+pub struct PrometheusExporter {
+    prefix: String,
+}
+
+// =============================================================================
+// Distributed Tracing Support
+// =============================================================================
+
+/// Trace ID for distributed tracing (W3C Trace Context compatible)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TraceId(pub String);
+
+impl TraceId {
+    /// Generate a new random trace ID (128-bit hex string)
+    pub fn generate() -> Self {
+        let rng = ring::rand::SystemRandom::new();
+        let mut bytes = [0u8; 16];
+        ring::rand::SecureRandom::fill(&rng, &mut bytes).expect("Failed to generate trace ID");
+        Self(hex::encode(&bytes))
+    }
+
+    /// Create from existing hex string
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(Self(hex.to_string()))
+        } else {
+            None
+        }
+    }
+}
+
+impl std::fmt::Display for TraceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Span ID for distributed tracing
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SpanId(pub String);
+
+impl SpanId {
+    /// Generate a new random span ID (64-bit hex string)
+    pub fn generate() -> Self {
+        let rng = ring::rand::SystemRandom::new();
+        let mut bytes = [0u8; 8];
+        ring::rand::SecureRandom::fill(&rng, &mut bytes).expect("Failed to generate span ID");
+        Self(hex::encode(&bytes))
+    }
+}
+
+impl std::fmt::Display for SpanId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Trace context for propagation (W3C Trace Context format)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceContext {
+    pub trace_id: TraceId,
+    pub span_id: SpanId,
+    pub parent_span_id: Option<SpanId>,
+    pub sampled: bool,
+}
+
+impl TraceContext {
+    /// Create a new root trace context
+    pub fn new() -> Self {
+        Self {
+            trace_id: TraceId::generate(),
+            span_id: SpanId::generate(),
+            parent_span_id: None,
+            sampled: true,
+        }
+    }
+
+    /// Create a child span context
+    pub fn child(&self) -> Self {
+        Self {
+            trace_id: self.trace_id.clone(),
+            span_id: SpanId::generate(),
+            parent_span_id: Some(self.span_id.clone()),
+            sampled: self.sampled,
+        }
+    }
+
+    /// Format as W3C traceparent header
+    pub fn to_traceparent(&self) -> String {
+        let flags = if self.sampled { "01" } else { "00" };
+        format!("00-{}-{}-{}", self.trace_id.0, self.span_id.0, flags)
+    }
+
+    /// Parse from W3C traceparent header
+    pub fn from_traceparent(header: &str) -> Option<Self> {
+        let parts: Vec<&str> = header.split('-').collect();
+        if parts.len() != 4 || parts[0] != "00" {
+            return None;
+        }
+
+        let trace_id = TraceId::from_hex(parts[1])?;
+        let span_id = SpanId(parts[2].to_string());
+        let sampled = parts[3] == "01";
+
+        Some(Self {
+            trace_id,
+            span_id,
+            parent_span_id: None,
+            sampled,
+        })
+    }
+}
+
+impl Default for TraceContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A trace span representing a unit of work
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Span {
+    pub name: String,
+    pub context: TraceContext,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
+    pub attributes: HashMap<String, String>,
+    pub status: SpanStatus,
+}
+
+/// Status of a span
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanStatus {
+    Ok,
+    Error,
+    Unset,
+}
+
+impl Default for SpanStatus {
+    fn default() -> Self {
+        Self::Unset
+    }
+}
+
+impl Span {
+    /// Create a new span
+    pub fn new(name: &str, context: TraceContext) -> Self {
+        Self {
+            name: name.to_string(),
+            context,
+            start_time: Utc::now(),
+            end_time: None,
+            attributes: HashMap::new(),
+            status: SpanStatus::Unset,
+        }
+    }
+
+    /// Add an attribute to the span
+    pub fn with_attribute(mut self, key: &str, value: &str) -> Self {
+        self.attributes.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Set the span status
+    pub fn set_status(&mut self, status: SpanStatus) {
+        self.status = status;
+    }
+
+    /// End the span
+    pub fn end(&mut self) {
+        self.end_time = Some(Utc::now());
+    }
+
+    /// Get duration in milliseconds
+    pub fn duration_ms(&self) -> Option<i64> {
+        self.end_time.map(|end| (end - self.start_time).num_milliseconds())
+    }
+}
+
+/// Simple hex encoding (we already have base64, but traces use hex)
+mod hex {
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
+    pub fn encode(bytes: &[u8]) -> String {
+        let mut result = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            result.push(HEX_CHARS[(byte >> 4) as usize] as char);
+            result.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
+        }
+        result
+    }
+}
+
+impl PrometheusExporter {
+    pub fn new(prefix: &str) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+        }
+    }
+
+    /// Format metrics in Prometheus exposition format
+    pub fn format(&self, metrics: &ServerMetrics) -> String {
+        let mut output = String::new();
+
+        // Active connections gauge
+        output.push_str(&format!(
+            "# HELP {}_active_connections Number of active connections\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_active_connections gauge\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_active_connections {}\n\n",
+            self.prefix, metrics.active_connections
+        ));
+
+        // Total requests counter
+        output.push_str(&format!(
+            "# HELP {}_requests_total Total number of requests\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_requests_total counter\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_requests_total {}\n\n",
+            self.prefix, metrics.total_requests
+        ));
+
+        // Requests per minute gauge
+        output.push_str(&format!(
+            "# HELP {}_requests_per_minute Current request rate\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_requests_per_minute gauge\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_requests_per_minute {:.2}\n\n",
+            self.prefix, metrics.requests_per_minute
+        ));
+
+        // Uptime gauge
+        output.push_str(&format!(
+            "# HELP {}_uptime_seconds Server uptime in seconds\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_uptime_seconds gauge\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_uptime_seconds {}\n\n",
+            self.prefix, metrics.uptime_seconds
+        ));
+
+        // Cache stats
+        output.push_str(&format!(
+            "# HELP {}_cache_hits Total cache hits\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_cache_hits counter\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_cache_hits {}\n\n",
+            self.prefix, metrics.cache_stats.hits
+        ));
+
+        output.push_str(&format!(
+            "# HELP {}_cache_misses Total cache misses\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "# TYPE {}_cache_misses counter\n",
+            self.prefix
+        ));
+        output.push_str(&format!(
+            "{}_cache_misses {}\n\n",
+            self.prefix, metrics.cache_stats.misses
+        ));
+
+        // Tool-specific metrics
+        for tool_stat in &metrics.tool_stats {
+            let tool_name = tool_stat.tool.as_str().to_lowercase();
+
+            output.push_str(&format!(
+                "{}_tool_requests_total{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.total_requests
+            ));
+            output.push_str(&format!(
+                "{}_tool_successful_requests{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.successful_requests
+            ));
+            output.push_str(&format!(
+                "{}_tool_failed_requests{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.failed_requests
+            ));
+            output.push_str(&format!(
+                "{}_tool_avg_latency_ms{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.avg_latency_ms
+            ));
+            output.push_str(&format!(
+                "{}_tool_rate_limit_hits{{tool=\"{}\"}} {}\n",
+                self.prefix, tool_name, tool_stat.rate_limit_hits
+            ));
+        }
+
+        output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rate_limiter() {
+        let config = RateLimitConfig {
+            max_requests: 5,
+            window_seconds: 60,
+            max_connections_per_ip: 3,
+            cleanup_interval_seconds: 300,
+        };
+        let limiter = RateLimiter::new(config);
+
+        for _ in 0..5 {
+            assert!(limiter.check("user1").is_allowed());
+        }
+        assert!(!limiter.check("user1").is_allowed());
+    }
+
+    #[test]
+    fn test_response_cache() {
+        let config = CacheConfig {
+            max_entries: 2,
+            ttl_seconds: 3600,
+            max_memory_bytes: 1024,
+        };
+        let cache: ResponseCache<String, String> = ResponseCache::new(config);
+
+        cache.insert("key1".to_string(), "value1".to_string(), 10);
+        cache.insert("key2".to_string(), "value2".to_string(), 10);
+
+        assert_eq!(cache.get(&"key1".to_string()), Some("value1".to_string()));
+        assert_eq!(cache.get(&"key2".to_string()), Some("value2".to_string()));
+
+        // Third insert should evict oldest
+        cache.insert("key3".to_string(), "value3".to_string(), 10);
+        assert!(cache.get(&"key1".to_string()).is_none() || cache.get(&"key2".to_string()).is_none());
+    }
+
+    #[test]
+    fn test_context_window_manager() {
+        let config = ContextWindowConfig {
+            max_tokens: 1000,
+            response_reserve: 100,
+            estimation_method: TokenEstimationMethod::CharDivide4,
+        };
+        let manager = ContextWindowManager::new(config);
+
+        assert_eq!(manager.available_tokens(), 900);
+        assert!(manager.fits("short text"));
+
+        let long_text = "x".repeat(5000);
+        assert!(!manager.fits(&long_text));
+
+        let truncated = manager.truncate_to_fit(&long_text);
+        assert!(manager.fits(&truncated));
+    }
+
+    #[test]
+    fn test_plugin_validator() {
+        let validator = PluginValidator::new(PluginValidationConfig::default());
+
+        assert!(validator.validate_command("python script.py").is_ok());
+        assert!(validator.validate_command("rm -rf /").is_err());
+        assert!(validator.validate_interpreter("python").is_ok());
+        assert!(validator.validate_interpreter("evil-binary").is_err());
+    }
+
+    #[test]
+    fn test_api_key_encryption() {
+        let manager = ApiKeyManager::new("test-password");
+        let api_key = "sk-test-1234567890abcdef";
+
+        let encrypted = manager.encrypt(api_key).unwrap();
+        assert!(!encrypted.is_empty());
+        assert!(encrypted.len() > api_key.len()); // Should include nonce + tag
+
+        let decrypted = manager.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, api_key);
+    }
+
+    #[test]
+    fn test_api_key_validation() {
+        assert!(ApiKeyManager::validate_key_format("sk-test-1234567890").is_ok());
+        assert!(ApiKeyManager::validate_key_format("").is_err());
+        assert!(ApiKeyManager::validate_key_format("short").is_err());
+        assert!(ApiKeyManager::validate_key_format("key with spaces").is_err());
+    }
+
+    #[test]
+    fn test_stream_buffer() {
+        let config = StreamConfig {
+            min_chunk_size: 10,
+            max_chunk_size: 20,
+            flush_interval_ms: 1000,
+            backpressure_enabled: false,
+        };
+        let mut buffer = StreamBuffer::new(config);
+
+        buffer.push("Hello ");
+        assert!(!buffer.should_flush()); // Below min size
+
+        buffer.push("World!");
+        assert!(buffer.should_flush()); // Above min size
+
+        let chunks = buffer.flush();
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks[0].sequence, 0);
+    }
+
+    #[test]
+    fn test_stream_finalize() {
+        let mut buffer = StreamBuffer::new(StreamConfig::default());
+        buffer.push("Test data");
+
+        let chunks = buffer.finalize();
+        assert!(!chunks.is_empty());
+        assert!(chunks.last().unwrap().is_final);
+    }
+
+    #[test]
+    fn test_health_checker_failover() {
+        let checker = HealthChecker::new(HealthCheckConfig {
+            failure_threshold: 2,
+            recovery_threshold: 1,
+            ..Default::default()
+        });
+
+        // Initially all healthy
+        assert!(checker.is_healthy(Tool::Claude));
+
+        // Simulate failures
+        checker.record_failure(Tool::Claude);
+        checker.record_failure(Tool::Claude);
+
+        // Claude should now be unhealthy
+        assert!(!checker.is_healthy(Tool::Claude));
+
+        // Gemini should still be healthy
+        assert!(checker.is_healthy(Tool::Gemini));
+
+        // Failover should return a healthy tool (not Claude)
+        let fallback = checker.get_tool_with_fallback(Tool::Claude, Tool::all());
+        assert!(fallback.is_some());
+        assert_ne!(fallback, Some(Tool::Claude));
+        assert!(checker.is_healthy(fallback.unwrap()));
+    }
+
+    #[test]
+    fn test_webhook_signature() {
+        let payload = r#"{"event":"test"}"#;
+        let secret = "webhook-secret";
+
+        let sig = compute_webhook_signature(payload, secret);
+        assert!(!sig.is_empty());
+
+        // Same inputs should produce same signature
+        let sig2 = compute_webhook_signature(payload, secret);
+        assert_eq!(sig, sig2);
+    }
+}

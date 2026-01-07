@@ -58,14 +58,17 @@ impl HistoryManager {
 
         let session = ChatSession::new(self.current_project.clone());
         self.current_session = Some(session);
-        self.current_session.as_mut().unwrap()
+        // Safe: we just assigned Some above
+        self.current_session.as_mut().expect("session was just created")
     }
 
     pub fn current_session(&mut self) -> &mut ChatSession {
         if self.current_session.is_none() {
-            self.new_session();
+            let session = ChatSession::new(self.current_project.clone());
+            self.current_session = Some(session);
         }
-        self.current_session.as_mut().unwrap()
+        // Safe: we ensure Some exists above
+        self.current_session.as_mut().expect("session must exist after init check")
     }
 
     pub fn has_session(&self) -> bool {

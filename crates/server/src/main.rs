@@ -25,6 +25,8 @@ use tokio::signal;
 use tracing::{info, error, debug};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
+use parking_lot::RwLock;
+use std::collections::HashMap;
 
 use polyglot_common::{
     ClientMessage, ServerMessage, Tool,
@@ -36,6 +38,7 @@ use config::ServerConfig;
 use auth::{SessionManager, UserManager};
 use tools::{ToolManager, ToolRequest, ToolOutput};
 use sync::SyncManager;
+use sync::ondemand::OnDemandSync;
 use usage::UsageTracker;
 use protocol::{StreamReader, StreamWriter};
 
@@ -131,6 +134,7 @@ struct ServerState {
     sync_manager: SyncManager,
     #[allow(dead_code)]
     usage_tracker: UsageTracker,
+    session_env: RwLock<HashMap<Uuid, Vec<(String, String)>>>,
     shutdown: AtomicBool,
 }
 
@@ -229,6 +233,7 @@ async fn start_server(config: ServerConfig) -> Result<()> {
         tool_manager,
         sync_manager,
         usage_tracker,
+        session_env: RwLock::new(HashMap::new()),
         shutdown: AtomicBool::new(false),
     });
 
@@ -393,6 +398,7 @@ async fn handle_connection(
 
     if let Some(sid) = session_id {
         state.session_manager.remove_session(sid);
+        state.session_env.write().remove(&sid);
     }
 
     info!("Connection closed: {}", remote_addr);
@@ -469,13 +475,37 @@ async fn handle_message(
             }
         }
 
+        ClientMessage::SetEnv { entries } => {
+            let sid = match session_id {
+                Some(id) => *id,
+                None => {
+                    response_tx.send(ServerMessage::Error {
+                        code: ErrorCode::AuthFailed,
+                        message: "Authenticate before setting environment variables.".to_string(),
+                    }).await.ok();
+                    return Ok(());
+                }
+            };
+
+            let sanitized = sanitize_env_entries(entries);
+            state.session_env.write().insert(sid, sanitized.clone());
+            response_tx.send(ServerMessage::EnvAck {
+                applied: sanitized.len() as u32,
+            }).await.ok();
+        }
+
         ClientMessage::Prompt { tool, message, working_dir } => {
             let tool = tool.or(*current_tool).unwrap_or(state.config.tools.default_tool);
+
+            let session_env = session_id
+                .and_then(|sid| state.session_env.read().get(&sid).cloned())
+                .unwrap_or_default();
 
             let request = ToolRequest {
                 message,
                 working_dir,
                 context_files: Vec::new(),
+                env: session_env,
             };
 
             let (tool_tx, mut tool_rx) = mpsc::channel::<ToolOutput>(100);
@@ -630,6 +660,42 @@ async fn handle_message(
             }
         }
 
+        ClientMessage::FileRequest { path } => {
+            let sync_dir = state.sync_manager.user_sync_dir(
+                &session_id.map(|s| s.to_string()).unwrap_or_default()
+            );
+            let full_path = sync_dir.join(&path);
+            let ondemand = OnDemandSync::new(&state.sync_manager);
+
+            match ondemand.read_file_chunks(&full_path) {
+                Ok(chunks) => {
+                    let total_size = chunks.total_size();
+                    let mut bytes_transferred = 0u64;
+                    for (offset, data, is_last) in chunks {
+                        bytes_transferred += data.len() as u64;
+                        response_tx.send(ServerMessage::FileChunk {
+                            path: path.clone(),
+                            offset,
+                            total_size,
+                            data,
+                            is_last,
+                        }).await.ok();
+                    }
+                    response_tx.send(ServerMessage::SyncComplete {
+                        path,
+                        files_synced: 1,
+                        bytes_transferred,
+                    }).await.ok();
+                }
+                Err(e) => {
+                    response_tx.send(ServerMessage::Error {
+                        code: ErrorCode::FileNotFound,
+                        message: e.to_string(),
+                    }).await.ok();
+                }
+            }
+        }
+
         ClientMessage::Ping { timestamp } => {
             response_tx.send(ServerMessage::Pong {
                 timestamp,
@@ -654,6 +720,7 @@ async fn handle_message(
         ClientMessage::Disconnect => {
             if let Some(sid) = session_id.take() {
                 state.session_manager.remove_session(sid);
+                state.session_env.write().remove(&sid);
             }
         }
 
@@ -666,6 +733,19 @@ async fn handle_message(
     }
 
     Ok(())
+}
+
+fn sanitize_env_entries(entries: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen = HashMap::new();
+    for (key, value) in entries {
+        let trimmed_key = key.trim();
+        if trimmed_key.is_empty() {
+            continue;
+        }
+        let trimmed_value = value.trim().to_string();
+        seen.insert(trimmed_key.to_string(), trimmed_value);
+    }
+    seen.into_iter().collect()
 }
 
 fn add_user(config: &ServerConfig, username: &str, admin: bool) -> Result<()> {

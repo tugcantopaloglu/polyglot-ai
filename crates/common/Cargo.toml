@@ -15,3 +15,5 @@ chrono = { workspace = true }
 base64 = { workspace = true }
 ring = { workspace = true }
 directories = { workspace = true }
+parking_lot = { workspace = true }
+rusqlite = { workspace = true }
