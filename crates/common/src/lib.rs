@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod context;
 pub mod updater;
 pub mod features;
+pub mod storage;
 
 pub use protocol::{
     ClientMessage, ServerMessage, OutputType, ToolInfo, SwitchReason, ErrorCode,
@@ -33,6 +34,9 @@ pub use features::{
     MetricsCollector, ServerMetrics,
     ContextWindowManager, ContextWindowConfig, TokenEstimationMethod, PromptValidation,
     PluginValidator, PluginValidationConfig, PluginValidationError,
+    ApiKeyManager, ApiKeyError,
+    WebhookEvent, WebhookPayload, WebhookConfig, compute_webhook_signature,
+    StreamConfig, StreamBuffer, StreamChunk,
 };
 
 pub use updater::{
@@ -41,4 +45,10 @@ pub use updater::{
     version_compare, get_platform_asset_name, get_backup_dir,
     create_backup, restore_backup, cleanup_old_backups,
     get_current_exe, verify_binary, format_bytes, print_status,
+};
+
+pub use storage::{
+    Database, StorageError,
+    StoredQuota, StoredSession, StoredApiKey, StoredWebhook,
+    CachedResponse, AuditLogEntry,
 };

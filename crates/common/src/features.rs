@@ -569,6 +569,61 @@ impl HealthChecker {
         let health = self.health.read();
         health.values().all(|s| s.healthy)
     }
+
+    /// Get a list of healthy tools, ordered by latency (best first)
+    pub fn get_healthy_tools(&self) -> Vec<Tool> {
+        let health = self.health.read();
+        let mut healthy: Vec<_> = health.iter()
+            .filter(|(_, state)| state.healthy)
+            .map(|(tool, state)| (*tool, state.latency_ms.unwrap_or(u32::MAX)))
+            .collect();
+        healthy.sort_by_key(|(_, latency)| *latency);
+        healthy.into_iter().map(|(tool, _)| tool).collect()
+    }
+
+    /// Get a fallback tool if the requested tool is unhealthy
+    /// Returns the requested tool if healthy, otherwise the best healthy alternative
+    pub fn get_tool_with_fallback(&self, requested: Tool, allowed_tools: &[Tool]) -> Option<Tool> {
+        if self.is_healthy(requested) {
+            return Some(requested);
+        }
+
+        // Find the best healthy alternative from allowed tools
+        let healthy_tools = self.get_healthy_tools();
+        for tool in healthy_tools {
+            if allowed_tools.contains(&tool) {
+                return Some(tool);
+            }
+        }
+
+        // If no healthy alternative, return the requested tool anyway
+        Some(requested)
+    }
+
+    /// Get priority-ordered failover chain for a tool
+    pub fn get_failover_chain(&self, primary: Tool, allowed: &[Tool]) -> Vec<Tool> {
+        let mut chain = Vec::with_capacity(allowed.len());
+
+        // Add primary first if healthy
+        if self.is_healthy(primary) {
+            chain.push(primary);
+        }
+
+        // Add other healthy tools by latency
+        let healthy = self.get_healthy_tools();
+        for tool in healthy {
+            if tool != primary && allowed.contains(&tool) && !chain.contains(&tool) {
+                chain.push(tool);
+            }
+        }
+
+        // Add primary at the end if not already added
+        if !chain.contains(&primary) {
+            chain.push(primary);
+        }
+
+        chain
+    }
 }
 
 // =============================================================================
@@ -988,6 +1043,351 @@ impl std::fmt::Display for PluginValidationError {
 
 impl std::error::Error for PluginValidationError {}
 
+// =============================================================================
+// API Key Encryption
+// =============================================================================
+
+/// Encrypted API key manager
+pub struct ApiKeyManager {
+    encryption_key: [u8; 32],
+}
+
+impl ApiKeyManager {
+    /// Create a new manager with a derived key from password
+    pub fn new(password: &str) -> Self {
+        let mut key = [0u8; 32];
+        // Use PBKDF2 to derive key from password
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            std::num::NonZeroU32::new(100_000).unwrap(),
+            b"polyglot-ai-salt", // In production, use unique salt per installation
+            password.as_bytes(),
+            &mut key,
+        );
+        Self { encryption_key: key }
+    }
+
+    /// Create a manager with a raw 32-byte key
+    pub fn from_key(key: [u8; 32]) -> Self {
+        Self { encryption_key: key }
+    }
+
+    /// Generate a random encryption key
+    pub fn generate_key() -> [u8; 32] {
+        let rng = ring::rand::SystemRandom::new();
+        let mut key = [0u8; 32];
+        ring::rand::SecureRandom::fill(&rng, &mut key).expect("Failed to generate random key");
+        key
+    }
+
+    /// Encrypt an API key
+    pub fn encrypt(&self, api_key: &str) -> Result<Vec<u8>, ApiKeyError> {
+        let rng = ring::rand::SystemRandom::new();
+
+        // Generate a random 12-byte nonce
+        let mut nonce = [0u8; 12];
+        ring::rand::SecureRandom::fill(&rng, &mut nonce)
+            .map_err(|_| ApiKeyError::EncryptionFailed("Failed to generate nonce".to_string()))?;
+
+        // Create the sealing key
+        let unbound_key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &self.encryption_key)
+            .map_err(|_| ApiKeyError::EncryptionFailed("Invalid encryption key".to_string()))?;
+        let sealing_key = ring::aead::LessSafeKey::new(unbound_key);
+
+        // Encrypt the data
+        let mut in_out = api_key.as_bytes().to_vec();
+        sealing_key
+            .seal_in_place_append_tag(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::empty(),
+                &mut in_out,
+            )
+            .map_err(|_| ApiKeyError::EncryptionFailed("Encryption failed".to_string()))?;
+
+        // Prepend nonce to encrypted data
+        let mut result = nonce.to_vec();
+        result.extend(in_out);
+        Ok(result)
+    }
+
+    /// Decrypt an API key
+    pub fn decrypt(&self, encrypted: &[u8]) -> Result<String, ApiKeyError> {
+        if encrypted.len() < 13 {
+            return Err(ApiKeyError::DecryptionFailed("Data too short".to_string()));
+        }
+
+        // Extract nonce and ciphertext
+        let nonce: [u8; 12] = encrypted[..12].try_into()
+            .map_err(|_| ApiKeyError::DecryptionFailed("Invalid nonce".to_string()))?;
+        let mut ciphertext = encrypted[12..].to_vec();
+
+        // Create the opening key
+        let unbound_key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &self.encryption_key)
+            .map_err(|_| ApiKeyError::DecryptionFailed("Invalid encryption key".to_string()))?;
+        let opening_key = ring::aead::LessSafeKey::new(unbound_key);
+
+        // Decrypt the data
+        let plaintext = opening_key
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::empty(),
+                &mut ciphertext,
+            )
+            .map_err(|_| ApiKeyError::DecryptionFailed("Decryption failed".to_string()))?;
+
+        String::from_utf8(plaintext.to_vec())
+            .map_err(|_| ApiKeyError::DecryptionFailed("Invalid UTF-8".to_string()))
+    }
+
+    /// Validate that an API key looks reasonable (basic format check)
+    pub fn validate_key_format(api_key: &str) -> Result<(), ApiKeyError> {
+        if api_key.is_empty() {
+            return Err(ApiKeyError::InvalidFormat("API key is empty".to_string()));
+        }
+        if api_key.len() < 10 {
+            return Err(ApiKeyError::InvalidFormat("API key too short".to_string()));
+        }
+        if api_key.len() > 500 {
+            return Err(ApiKeyError::InvalidFormat("API key too long".to_string()));
+        }
+        // Check for common API key patterns
+        let has_valid_chars = api_key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+        if !has_valid_chars {
+            return Err(ApiKeyError::InvalidFormat("API key contains invalid characters".to_string()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ApiKeyError {
+    EncryptionFailed(String),
+    DecryptionFailed(String),
+    InvalidFormat(String),
+}
+
+impl std::fmt::Display for ApiKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EncryptionFailed(msg) => write!(f, "Encryption failed: {}", msg),
+            Self::DecryptionFailed(msg) => write!(f, "Decryption failed: {}", msg),
+            Self::InvalidFormat(msg) => write!(f, "Invalid API key format: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ApiKeyError {}
+
+// =============================================================================
+// Webhook Notifier
+// =============================================================================
+
+/// Event types for webhook notifications
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookEvent {
+    RequestCompleted,
+    RequestFailed,
+    RateLimited,
+    QuotaExceeded,
+    ToolHealthChanged,
+    UserConnected,
+    UserDisconnected,
+}
+
+impl WebhookEvent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RequestCompleted => "request_completed",
+            Self::RequestFailed => "request_failed",
+            Self::RateLimited => "rate_limited",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::ToolHealthChanged => "tool_health_changed",
+            Self::UserConnected => "user_connected",
+            Self::UserDisconnected => "user_disconnected",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "request_completed" => Some(Self::RequestCompleted),
+            "request_failed" => Some(Self::RequestFailed),
+            "rate_limited" => Some(Self::RateLimited),
+            "quota_exceeded" => Some(Self::QuotaExceeded),
+            "tool_health_changed" => Some(Self::ToolHealthChanged),
+            "user_connected" => Some(Self::UserConnected),
+            "user_disconnected" => Some(Self::UserDisconnected),
+            _ => None,
+        }
+    }
+}
+
+/// Webhook payload sent to configured endpoints
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookPayload {
+    pub event: String,
+    pub timestamp: DateTime<Utc>,
+    pub data: serde_json::Value,
+}
+
+impl WebhookPayload {
+    pub fn new(event: WebhookEvent, data: serde_json::Value) -> Self {
+        Self {
+            event: event.as_str().to_string(),
+            timestamp: Utc::now(),
+            data,
+        }
+    }
+}
+
+/// Configuration for a webhook endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    pub url: String,
+    pub events: Vec<WebhookEvent>,
+    pub secret: Option<String>,
+    pub timeout_ms: u64,
+    pub max_retries: u32,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            events: vec![WebhookEvent::RequestFailed, WebhookEvent::ToolHealthChanged],
+            secret: None,
+            timeout_ms: 5000,
+            max_retries: 3,
+        }
+    }
+}
+
+/// Compute HMAC signature for webhook payload
+pub fn compute_webhook_signature(payload: &str, secret: &str) -> String {
+    use ring::hmac;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
+    let signature = hmac::sign(&key, payload.as_bytes());
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature.as_ref())
+}
+
+// =============================================================================
+// Response Streaming
+// =============================================================================
+
+/// Streaming configuration for responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamConfig {
+    /// Minimum chunk size in bytes
+    pub min_chunk_size: usize,
+    /// Maximum chunk size in bytes
+    pub max_chunk_size: usize,
+    /// Flush interval in milliseconds
+    pub flush_interval_ms: u64,
+    /// Enable backpressure handling
+    pub backpressure_enabled: bool,
+}
+
+impl Default for StreamConfig {
+    fn default() -> Self {
+        Self {
+            min_chunk_size: 10,
+            max_chunk_size: 4096,
+            flush_interval_ms: 100,
+            backpressure_enabled: true,
+        }
+    }
+}
+
+/// Stream buffer for accumulating and chunking response data
+pub struct StreamBuffer {
+    buffer: String,
+    sequence: u32,
+    config: StreamConfig,
+    last_flush: Instant,
+}
+
+impl StreamBuffer {
+    pub fn new(config: StreamConfig) -> Self {
+        Self {
+            buffer: String::new(),
+            sequence: 0,
+            config,
+            last_flush: Instant::now(),
+        }
+    }
+
+    /// Add data to the buffer
+    pub fn push(&mut self, data: &str) {
+        self.buffer.push_str(data);
+    }
+
+    /// Check if the buffer should be flushed
+    pub fn should_flush(&self) -> bool {
+        self.buffer.len() >= self.config.min_chunk_size
+            || self.last_flush.elapsed().as_millis() as u64 >= self.config.flush_interval_ms
+    }
+
+    /// Flush the buffer and return chunks
+    pub fn flush(&mut self) -> Vec<StreamChunk> {
+        if self.buffer.is_empty() {
+            return Vec::new();
+        }
+
+        let mut chunks = Vec::new();
+        while !self.buffer.is_empty() {
+            let chunk_size = self.buffer.len().min(self.config.max_chunk_size);
+
+            // Try to break at word boundary
+            let actual_size = if chunk_size < self.buffer.len() {
+                self.buffer[..chunk_size]
+                    .rfind(|c: char| c.is_whitespace())
+                    .map(|pos| pos + 1)
+                    .unwrap_or(chunk_size)
+            } else {
+                chunk_size
+            };
+
+            let content: String = self.buffer.drain(..actual_size).collect();
+            chunks.push(StreamChunk {
+                content,
+                sequence: self.sequence,
+                is_final: false,
+            });
+            self.sequence += 1;
+        }
+
+        self.last_flush = Instant::now();
+        chunks
+    }
+
+    /// Finalize the stream and return any remaining data
+    pub fn finalize(&mut self) -> Vec<StreamChunk> {
+        let mut chunks = self.flush();
+
+        // Add final marker
+        chunks.push(StreamChunk {
+            content: String::new(),
+            sequence: self.sequence,
+            is_final: true,
+        });
+
+        chunks
+    }
+
+    /// Get current sequence number
+    pub fn sequence(&self) -> u32 {
+        self.sequence
+    }
+}
+
+/// A chunk of streamed response data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamChunk {
+    pub content: String,
+    pub sequence: u32,
+    pub is_final: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1055,5 +1455,98 @@ mod tests {
         assert!(validator.validate_command("rm -rf /").is_err());
         assert!(validator.validate_interpreter("python").is_ok());
         assert!(validator.validate_interpreter("evil-binary").is_err());
+    }
+
+    #[test]
+    fn test_api_key_encryption() {
+        let manager = ApiKeyManager::new("test-password");
+        let api_key = "sk-test-1234567890abcdef";
+
+        let encrypted = manager.encrypt(api_key).unwrap();
+        assert!(!encrypted.is_empty());
+        assert!(encrypted.len() > api_key.len()); // Should include nonce + tag
+
+        let decrypted = manager.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, api_key);
+    }
+
+    #[test]
+    fn test_api_key_validation() {
+        assert!(ApiKeyManager::validate_key_format("sk-test-1234567890").is_ok());
+        assert!(ApiKeyManager::validate_key_format("").is_err());
+        assert!(ApiKeyManager::validate_key_format("short").is_err());
+        assert!(ApiKeyManager::validate_key_format("key with spaces").is_err());
+    }
+
+    #[test]
+    fn test_stream_buffer() {
+        let config = StreamConfig {
+            min_chunk_size: 10,
+            max_chunk_size: 20,
+            flush_interval_ms: 1000,
+            backpressure_enabled: false,
+        };
+        let mut buffer = StreamBuffer::new(config);
+
+        buffer.push("Hello ");
+        assert!(!buffer.should_flush()); // Below min size
+
+        buffer.push("World!");
+        assert!(buffer.should_flush()); // Above min size
+
+        let chunks = buffer.flush();
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks[0].sequence, 0);
+    }
+
+    #[test]
+    fn test_stream_finalize() {
+        let mut buffer = StreamBuffer::new(StreamConfig::default());
+        buffer.push("Test data");
+
+        let chunks = buffer.finalize();
+        assert!(!chunks.is_empty());
+        assert!(chunks.last().unwrap().is_final);
+    }
+
+    #[test]
+    fn test_health_checker_failover() {
+        let checker = HealthChecker::new(HealthCheckConfig {
+            failure_threshold: 2,
+            recovery_threshold: 1,
+            ..Default::default()
+        });
+
+        // Initially all healthy
+        assert!(checker.is_healthy(Tool::Claude));
+
+        // Simulate failures
+        checker.record_failure(Tool::Claude);
+        checker.record_failure(Tool::Claude);
+
+        // Claude should now be unhealthy
+        assert!(!checker.is_healthy(Tool::Claude));
+
+        // Gemini should still be healthy
+        assert!(checker.is_healthy(Tool::Gemini));
+
+        // Failover should return a healthy tool (not Claude)
+        let fallback = checker.get_tool_with_fallback(Tool::Claude, Tool::all());
+        assert!(fallback.is_some());
+        assert_ne!(fallback, Some(Tool::Claude));
+        assert!(checker.is_healthy(fallback.unwrap()));
+    }
+
+    #[test]
+    fn test_webhook_signature() {
+        let payload = r#"{"event":"test"}"#;
+        let secret = "webhook-secret";
+
+        let sig = compute_webhook_signature(payload, secret);
+        assert!(!sig.is_empty());
+
+        // Same inputs should produce same signature
+        let sig2 = compute_webhook_signature(payload, secret);
+        assert_eq!(sig, sig2);
     }
 }

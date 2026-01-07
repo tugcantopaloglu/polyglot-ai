@@ -1,3 +1,5 @@
+mod dashboard;
+
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -32,6 +34,7 @@ use polyglot_common::{
     HealthChecker, HealthCheckConfig,
     MetricsCollector,
     ContextWindowManager, ContextWindowConfig,
+    Database, AuditLogEntry,
 };
 
 #[derive(Parser, Debug)]
@@ -146,6 +149,30 @@ struct Cli {
     #[arg(long, default_value_t = 24)]
     token_expiry_hours: u64,
 
+    /// Enable admin dashboard
+    #[arg(long, default_value_t = false)]
+    dashboard: bool,
+
+    /// Dashboard listen address
+    #[arg(long, default_value = "127.0.0.1:8788")]
+    dashboard_listen: String,
+
+    /// Dashboard authentication token (optional)
+    #[arg(long)]
+    dashboard_token: Option<String>,
+
+    /// Enable auto failover to alternative tools when primary is unhealthy
+    #[arg(long, default_value_t = true)]
+    auto_failover: bool,
+
+    /// Enable request audit logging to database
+    #[arg(long, default_value_t = false)]
+    audit_log: bool,
+
+    /// Database path for persistent storage
+    #[arg(long, default_value = "./bridge-data/polyglot.db")]
+    database: PathBuf,
+
     #[arg(short, long)]
     verbose: bool,
 }
@@ -160,6 +187,7 @@ struct BridgeState {
     context_manager: ContextWindowManager,
     config: BridgeConfig,
     token_sessions: RwLock<HashMap<String, TokenSession>>,
+    database: Option<Database>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +200,26 @@ struct TokenSession {
 
 impl BridgeState {
     fn new(config: BridgeConfig) -> Arc<Self> {
+        // Initialize database if audit logging is enabled
+        let database = if config.audit_log {
+            // Create parent directory if needed
+            if let Some(parent) = config.database_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match Database::open(&config.database_path) {
+                Ok(db) => {
+                    info!("Opened database at {:?}", config.database_path);
+                    Some(db)
+                }
+                Err(e) => {
+                    warn!("Failed to open database: {}, audit logging disabled", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Arc::new(Self {
             rate_limiter: RateLimiter::new(RateLimitConfig {
                 max_requests: config.rate_limit,
@@ -193,8 +241,29 @@ impl BridgeState {
                 estimation_method: polyglot_common::TokenEstimationMethod::CharDivide4,
             }),
             token_sessions: RwLock::new(HashMap::new()),
+            database,
             config,
         })
+    }
+
+    /// Get tool with automatic failover if enabled and tool is unhealthy
+    fn get_tool_with_failover(&self, requested: Tool) -> Tool {
+        if !self.config.auto_failover {
+            return requested;
+        }
+
+        self.health_checker
+            .get_tool_with_fallback(requested, Tool::all())
+            .unwrap_or(requested)
+    }
+
+    /// Log an audit entry to the database
+    fn log_audit(&self, entry: &AuditLogEntry) {
+        if let Some(ref db) = self.database {
+            if let Err(e) = db.log_audit(entry) {
+                warn!("Failed to log audit entry: {}", e);
+            }
+        }
     }
 
     fn check_rate_limit(&self, ip: &str) -> Result<(), ServerMessage> {
@@ -331,6 +400,9 @@ struct BridgeConfig {
     enable_cache: bool,
     cache_ttl: u64,
     token_expiry_hours: u64,
+    auto_failover: bool,
+    audit_log: bool,
+    database_path: PathBuf,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -485,6 +557,22 @@ async fn main() -> Result<()> {
         config.max_connections_per_ip,
         if config.enable_cache { "enabled" } else { "disabled" }
     );
+
+    // Start dashboard if enabled
+    if cli.dashboard {
+        let dashboard_config = dashboard::DashboardConfig {
+            enabled: true,
+            listen: cli.dashboard_listen.clone(),
+            require_auth: cli.dashboard_token.is_some(),
+            auth_token: cli.dashboard_token.clone(),
+        };
+        let dashboard_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dashboard::start_dashboard(dashboard_config, dashboard_state).await {
+                error!("Dashboard error: {}", e);
+            }
+        });
+    }
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -797,14 +885,15 @@ where
                     continue;
                 }
 
-                let selected_tool = tool.or(current_tool).unwrap_or(Tool::Claude);
+                let requested_tool = tool.or(current_tool).unwrap_or(Tool::Claude);
                 let use_tool_flag = tool.is_some() || current_tool.is_some();
-                current_tool = Some(selected_tool);
 
-                // Check tool health
-                if !state.health_checker.is_healthy(selected_tool) {
-                    warn!("Tool {} is unhealthy, proceeding anyway", selected_tool);
+                // Auto failover: get healthy tool if enabled
+                let selected_tool = state.get_tool_with_failover(requested_tool);
+                if selected_tool != requested_tool {
+                    info!("Tool failover: {} -> {}", requested_tool, selected_tool);
                 }
+                current_tool = Some(selected_tool);
 
                 // Check cache first if enabled
                 if config.enable_cache {
@@ -822,7 +911,7 @@ where
                 }
 
                 let start_time = std::time::Instant::now();
-                handle_prompt_local(
+                let result = handle_prompt_local(
                     &mut ws_write,
                     codec,
                     config,
@@ -831,7 +920,28 @@ where
                     use_tool_flag,
                     working_dir.as_deref(),
                     &env_entries,
-                ).await?;
+                ).await;
+
+                let latency_ms_u64 = start_time.elapsed().as_millis() as u64;
+                let success = result.is_ok();
+
+                // Audit logging
+                let audit_entry = AuditLogEntry::new("prompt")
+                    .with_user(&user_id)
+                    .with_tool(selected_tool)
+                    .with_latency(latency_ms_u64)
+                    .with_ip(client_ip);
+                let audit_entry = if !success {
+                    audit_entry.with_error("Request failed")
+                } else {
+                    audit_entry
+                };
+                state.log_audit(&audit_entry);
+
+                if let Err(e) = result {
+                    state.health_checker.record_failure(selected_tool);
+                    return Err(e);
+                }
 
                 // Record metrics
                 let latency_ms = start_time.elapsed().as_millis() as u32;
@@ -1475,6 +1585,9 @@ impl BridgeConfig {
             enable_cache: cli.enable_cache,
             cache_ttl: cli.cache_ttl,
             token_expiry_hours: cli.token_expiry_hours,
+            auto_failover: cli.auto_failover,
+            audit_log: cli.audit_log,
+            database_path: cli.database.clone(),
         }
     }
 }
@@ -1510,6 +1623,9 @@ fn load_config(path: &Path) -> Result<BridgeConfig> {
         enable_cache: false,
         cache_ttl: 3600,
         token_expiry_hours: 24,
+        auto_failover: true,
+        audit_log: false,
+        database_path: PathBuf::from("./bridge-data/polyglot.db"),
     };
 
     if let Some(listen) = parsed.listen {
