@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{info, error};
 
 use polyglot_common::{
-    ClientMessage, ServerMessage, Tool, SyncMode,
+    ClientMessage, ServerMessage, Tool, SyncMode, ExportFormat,
     encode_message, decode_message, PROTOCOL_VERSION, MAX_MESSAGE_SIZE,
 };
 
@@ -291,6 +291,36 @@ impl ClientConnection {
     /// Check server version and update availability
     pub async fn check_version(&mut self) -> Result<ServerMessage> {
         self.send_message(&ClientMessage::VersionCheck).await?;
+        self.recv_message().await
+    }
+
+    /// Check health status of all tools
+    pub async fn health_check(&mut self) -> Result<ServerMessage> {
+        self.send_message(&ClientMessage::HealthCheck).await?;
+        self.recv_message().await
+    }
+
+    /// Check quota status for current user
+    pub async fn quota_check(&mut self) -> Result<ServerMessage> {
+        self.send_message(&ClientMessage::QuotaCheck).await?;
+        self.recv_message().await
+    }
+
+    /// Get server metrics
+    pub async fn get_metrics(&mut self) -> Result<ServerMessage> {
+        self.send_message(&ClientMessage::GetMetrics).await?;
+        self.recv_message().await
+    }
+
+    /// Export chat history in specified format
+    pub async fn export_history(&mut self, format: ExportFormat) -> Result<ServerMessage> {
+        self.send_message(&ClientMessage::ExportHistory { format }).await?;
+        self.recv_message().await
+    }
+
+    /// Refresh authentication token
+    pub async fn refresh_token(&mut self) -> Result<ServerMessage> {
+        self.send_message(&ClientMessage::RefreshToken).await?;
         self.recv_message().await
     }
 

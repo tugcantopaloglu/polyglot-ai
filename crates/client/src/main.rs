@@ -15,7 +15,7 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use polyglot_common::{Tool, SyncMode, ServerMessage};
+use polyglot_common::{Tool, SyncMode, ServerMessage, ExportFormat};
 use config::ClientConfig;
 use connection::ClientConnection;
 use tui::{App, AppAction, OutputType};
@@ -101,6 +101,26 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Check health status of all AI tools
+    Health,
+
+    /// Check your quota usage
+    Quota,
+
+    /// Get server metrics
+    Metrics,
+
+    /// Export chat history
+    Export {
+        /// Output format: json, markdown, or html
+        #[arg(short, long, default_value = "markdown")]
+        format: String,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -140,6 +160,10 @@ async fn main() -> Result<()> {
             generate_certs(&output, &cn, &ca_cert, &ca_key)
         }
         Some(Commands::Update { check_only, force }) => run_update("polyglot", check_only, force).await,
+        Some(Commands::Health) => run_health(&config).await,
+        Some(Commands::Quota) => run_quota(&config).await,
+        Some(Commands::Metrics) => run_metrics(&config).await,
+        Some(Commands::Export { format, output }) => run_export(&config, &format, output).await,
     }
 }
 
@@ -826,6 +850,194 @@ async fn run_switch(config: &ClientConfig, tool_name: &str) -> Result<()> {
     match conn.select_tool(tool).await {
         Ok(ServerMessage::ToolSwitched { from, to, reason }) => {
             println!("Switched from {} to {} (reason: {})", from, to, reason);
+        }
+        Ok(ServerMessage::Error { code, message }) => {
+            eprintln!("Error: {} - {}", code, message);
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("Unexpected response");
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    conn.disconnect().await?;
+    Ok(())
+}
+
+async fn run_health(config: &ClientConfig) -> Result<()> {
+    let mut conn = ClientConnection::new(&config.connection).await?;
+    conn.connect(&config.connection).await?;
+
+    match conn.health_check().await {
+        Ok(ServerMessage::HealthStatus { tools, all_healthy }) => {
+            println!("Tool Health Status");
+            println!("==================");
+            println!();
+
+            for tool in tools {
+                let status = if tool.healthy { "✓ Healthy" } else { "✗ Unhealthy" };
+                let color = if tool.healthy { "\x1b[32m" } else { "\x1b[31m" };
+                println!("{}{}: {}\x1b[0m", color, tool.tool.display_name(), status);
+                if let Some(latency) = tool.latency_ms {
+                    println!("  Latency: {}ms", latency);
+                }
+                println!("  Failure count: {}", tool.failure_count);
+                if let Some(last) = tool.last_check {
+                    println!("  Last check: {}", last);
+                }
+                println!();
+            }
+
+            if all_healthy {
+                println!("\x1b[32m✓ All tools are healthy\x1b[0m");
+            } else {
+                println!("\x1b[33m⚠ Some tools are experiencing issues\x1b[0m");
+            }
+        }
+        Ok(ServerMessage::Error { code, message }) => {
+            eprintln!("Error: {} - {}", code, message);
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("Unexpected response");
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    conn.disconnect().await?;
+    Ok(())
+}
+
+async fn run_quota(config: &ClientConfig) -> Result<()> {
+    let mut conn = ClientConnection::new(&config.connection).await?;
+    conn.connect(&config.connection).await?;
+
+    match conn.quota_check().await {
+        Ok(ServerMessage::QuotaInfo { user_id, requests_used, requests_limit, tokens_used, tokens_limit, reset_at }) => {
+            println!("Quota Status for {}", user_id);
+            println!("==================");
+            println!();
+
+            let req_pct = if let Some(limit) = requests_limit {
+                (requests_used as f64 / limit as f64 * 100.0) as u32
+            } else {
+                0
+            };
+
+            println!("Requests: {} / {}", requests_used, requests_limit.map(|l| l.to_string()).unwrap_or("unlimited".to_string()));
+            if requests_limit.is_some() {
+                println!("  Usage: {}%", req_pct);
+            }
+            println!();
+
+            let tok_pct = if let Some(limit) = tokens_limit {
+                (tokens_used as f64 / limit as f64 * 100.0) as u32
+            } else {
+                0
+            };
+
+            println!("Tokens: {} / {}", tokens_used, tokens_limit.map(|l| l.to_string()).unwrap_or("unlimited".to_string()));
+            if tokens_limit.is_some() {
+                println!("  Usage: {}%", tok_pct);
+            }
+            println!();
+
+            if let Some(reset) = reset_at {
+                println!("Resets at: {}", reset);
+            }
+        }
+        Ok(ServerMessage::Error { code, message }) => {
+            eprintln!("Error: {} - {}", code, message);
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("Unexpected response");
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    conn.disconnect().await?;
+    Ok(())
+}
+
+async fn run_metrics(config: &ClientConfig) -> Result<()> {
+    let mut conn = ClientConnection::new(&config.connection).await?;
+    conn.connect(&config.connection).await?;
+
+    match conn.get_metrics().await {
+        Ok(ServerMessage::Metrics { metrics }) => {
+            println!("Server Metrics");
+            println!("==============");
+            println!();
+            println!("Active connections: {}", metrics.active_connections);
+            println!("Total requests: {}", metrics.total_requests);
+            println!("Requests/min: {:.2}", metrics.requests_per_minute);
+            println!("Uptime: {}s", metrics.uptime_seconds);
+            println!();
+            println!("Cache:");
+            println!("  Hits: {}", metrics.cache_stats.hits);
+            println!("  Misses: {}", metrics.cache_stats.misses);
+            println!("  Entries: {}", metrics.cache_stats.entries);
+            println!("  Memory: {} bytes", metrics.cache_stats.memory_bytes);
+            println!();
+            println!("Tool Statistics:");
+            for stat in &metrics.tool_stats {
+                println!("  {}:", stat.tool.display_name());
+                println!("    Requests: {} (success: {}, failed: {})",
+                    stat.total_requests, stat.successful_requests, stat.failed_requests);
+                println!("    Avg latency: {}ms", stat.avg_latency_ms);
+                println!("    Rate limits: {}", stat.rate_limit_hits);
+            }
+        }
+        Ok(ServerMessage::Error { code, message }) => {
+            eprintln!("Error: {} - {}", code, message);
+            std::process::exit(1);
+        }
+        Ok(_) => {
+            eprintln!("Unexpected response");
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    conn.disconnect().await?;
+    Ok(())
+}
+
+async fn run_export(config: &ClientConfig, format: &str, output: Option<PathBuf>) -> Result<()> {
+    let export_format = match format.to_lowercase().as_str() {
+        "json" => ExportFormat::Json,
+        "markdown" | "md" => ExportFormat::Markdown,
+        "html" => ExportFormat::Html,
+        _ => {
+            eprintln!("Invalid format. Use: json, markdown, or html");
+            std::process::exit(1);
+        }
+    };
+
+    let mut conn = ClientConnection::new(&config.connection).await?;
+    conn.connect(&config.connection).await?;
+
+    match conn.export_history(export_format).await {
+        Ok(ServerMessage::HistoryExport { format: _, content }) => {
+            if let Some(path) = output {
+                std::fs::write(&path, &content)?;
+                println!("Exported history to {:?}", path);
+            } else {
+                println!("{}", content);
+            }
         }
         Ok(ServerMessage::Error { code, message }) => {
             eprintln!("Error: {} - {}", code, message);
