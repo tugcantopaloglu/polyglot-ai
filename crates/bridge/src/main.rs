@@ -495,7 +495,21 @@ where
                 send_ws_message(&mut ws_write, codec, &response).await?;
             }
             ClientMessage::SetEnv { entries } => {
-                env_entries = entries;
+                // Validate and filter environment variables for security
+                env_entries = entries.into_iter()
+                    .filter(|(key, value)| {
+                        // Reject keys with dangerous characters or patterns
+                        !key.is_empty() &&
+                        key.chars().all(|c| c.is_alphanumeric() || c == '_') &&
+                        !key.starts_with("LD_") &&
+                        !key.starts_with("DYLD_") &&
+                        key != "PATH" &&
+                        // Reject values with shell injection characters
+                        !value.contains('\0') &&
+                        !value.contains('`') &&
+                        !value.contains("$(")
+                    })
+                    .collect();
                 let response = ServerMessage::EnvAck {
                     applied: env_entries.len() as u32,
                 };
@@ -868,16 +882,38 @@ where
     Ok(())
 }
 
+fn validate_rclone_path(path: &str) -> bool {
+    // Reject paths with shell injection patterns
+    !path.contains('`') &&
+    !path.contains("$(") &&
+    !path.contains('\0') &&
+    !path.contains(';') &&
+    !path.contains('|') &&
+    !path.contains('&') &&
+    !path.contains('\n') &&
+    !path.contains('\r')
+}
+
 async fn run_drive_sync(config: &BridgeConfig, direction: Option<&str>) -> Result<String> {
     let remote = config.drive_remote.as_ref()
         .ok_or_else(|| anyhow::anyhow!("Drive remote not configured"))?;
+
+    // Validate remote path for security
+    if !validate_rclone_path(remote) {
+        return Err(anyhow::anyhow!("Invalid characters in drive remote path"));
+    }
+
+    let local_path = config.drive_path.to_string_lossy();
+    if !validate_rclone_path(&local_path) {
+        return Err(anyhow::anyhow!("Invalid characters in local drive path"));
+    }
 
     std::fs::create_dir_all(&config.drive_path)
         .with_context(|| format!("Failed to create {:?}", config.drive_path))?;
 
     let (source, target) = match direction.unwrap_or("upload") {
-        "download" => (remote.as_str(), config.drive_path.to_string_lossy().as_ref()),
-        _ => (config.drive_path.to_string_lossy().as_ref(), remote.as_str()),
+        "download" => (remote.as_str(), local_path.as_ref()),
+        _ => (local_path.as_ref(), remote.as_str()),
     };
 
     let output = Command::new("rclone")
@@ -1021,10 +1057,17 @@ fn percent_decode(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(value) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                output.push(value);
-                i += 3;
-                continue;
+            // Safely extract hex digits as bytes and convert to string
+            let hex_bytes = &bytes[i + 1..i + 3];
+            if hex_bytes.iter().all(|b| b.is_ascii_hexdigit()) {
+                // Safe to convert since we verified ASCII hex digits
+                if let Ok(hex_str) = std::str::from_utf8(hex_bytes) {
+                    if let Ok(value) = u8::from_str_radix(hex_str, 16) {
+                        output.push(value);
+                        i += 3;
+                        continue;
+                    }
+                }
             }
         }
         output.push(bytes[i]);

@@ -83,8 +83,10 @@ impl ToolAdapter for CopilotAdapter {
             *self.current_process.lock() = Some(pid);
         }
 
-        let stdout = child.stdout.take().expect("stdout not captured");
-        let stderr = child.stderr.take().expect("stderr not captured");
+        let stdout = child.stdout.take()
+            .ok_or_else(|| ToolError::ExecutionFailed("Failed to capture stdout".to_string()))?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| ToolError::ExecutionFailed("Failed to capture stderr".to_string()))?;
 
         let output_tx_stdout = output_tx.clone();
         let output_tx_stderr = output_tx.clone();

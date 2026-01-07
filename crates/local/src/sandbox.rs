@@ -94,12 +94,17 @@ impl SandboxConfig {
             return Ok(());
         }
 
-        let canonical = path.canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf());
+        // Try to canonicalize the path. If it fails (e.g., path doesn't exist yet),
+        // we check both the original path and try to canonicalize the parent.
+        let paths_to_check = self.get_paths_to_check(path);
 
-        for allowed in &self.allowed_read_paths {
-            if canonical.starts_with(allowed) {
-                return Ok(());
+        for canonical in &paths_to_check {
+            for allowed in &self.allowed_read_paths {
+                // Also canonicalize allowed paths for consistent comparison
+                let allowed_canonical = allowed.canonicalize().unwrap_or_else(|_| allowed.clone());
+                if canonical.starts_with(&allowed_canonical) || canonical.starts_with(allowed) {
+                    return Ok(());
+                }
             }
         }
 
@@ -111,16 +116,44 @@ impl SandboxConfig {
             return Ok(());
         }
 
-        let canonical = path.canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf());
+        // Try to canonicalize the path. If it fails (e.g., path doesn't exist yet),
+        // we check both the original path and try to canonicalize the parent.
+        let paths_to_check = self.get_paths_to_check(path);
 
-        for allowed in &self.allowed_write_paths {
-            if canonical.starts_with(allowed) {
-                return Ok(());
+        for canonical in &paths_to_check {
+            for allowed in &self.allowed_write_paths {
+                // Also canonicalize allowed paths for consistent comparison
+                let allowed_canonical = allowed.canonicalize().unwrap_or_else(|_| allowed.clone());
+                if canonical.starts_with(&allowed_canonical) || canonical.starts_with(allowed) {
+                    return Ok(());
+                }
             }
         }
 
         bail!("Access denied: path '{}' is outside sandbox write boundaries", path.display())
+    }
+
+    fn get_paths_to_check(&self, path: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        // Try direct canonicalization first
+        if let Ok(canonical) = path.canonicalize() {
+            paths.push(canonical);
+        }
+
+        // If path doesn't exist, try canonicalizing parent and appending filename
+        if let Some(parent) = path.parent() {
+            if let Ok(canonical_parent) = parent.canonicalize() {
+                if let Some(filename) = path.file_name() {
+                    paths.push(canonical_parent.join(filename));
+                }
+            }
+        }
+
+        // Also include the original path for cases where symlinks are involved
+        paths.push(path.to_path_buf());
+
+        paths
     }
 
     pub fn filter_env_vars(&self, env: &[(String, String)]) -> Vec<(String, String)> {

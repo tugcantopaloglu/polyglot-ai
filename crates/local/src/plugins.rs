@@ -234,8 +234,10 @@ impl PluginManager {
         let mut child = cmd.spawn()
             .context(format!("Failed to start plugin: {}", name))?;
 
-        let stdout = child.stdout.take().expect("stdout not captured");
-        let stderr = child.stderr.take().expect("stderr not captured");
+        let stdout = child.stdout.take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout"))?;
+        let stderr = child.stderr.take()
+            .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
         let output_tx_stdout = output_tx.clone();
         let output_tx_stderr = output_tx.clone();
