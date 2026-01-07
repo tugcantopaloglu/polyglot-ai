@@ -440,6 +440,170 @@ pub fn create_transfer_context(session: &ChatSession, config: &SummarizerConfig)
     }
 }
 
+// =============================================================================
+// Conversation Export
+// =============================================================================
+
+use crate::ExportFormat;
+
+/// Export a chat session to the specified format
+pub fn export_session(session: &ChatSession, format: ExportFormat) -> String {
+    match format {
+        ExportFormat::Json => export_to_json(session),
+        ExportFormat::Markdown => export_to_markdown(session),
+        ExportFormat::Html => export_to_html(session),
+    }
+}
+
+fn export_to_json(session: &ChatSession) -> String {
+    serde_json::to_string_pretty(session).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn export_to_markdown(session: &ChatSession) -> String {
+    let mut output = String::new();
+
+    // Header
+    output.push_str(&format!("# {}\n\n", session.display_title()));
+    output.push_str(&format!("**Created:** {}\n", session.created_at.format("%Y-%m-%d %H:%M:%S UTC")));
+    output.push_str(&format!("**Updated:** {}\n", session.updated_at.format("%Y-%m-%d %H:%M:%S UTC")));
+
+    if let Some(ref project) = session.project_path {
+        output.push_str(&format!("**Project:** {}\n", project));
+    }
+    if let Some(ref tool) = session.tool {
+        output.push_str(&format!("**Tool:** {}\n", tool.display_name()));
+    }
+
+    output.push_str("\n---\n\n");
+
+    // Messages
+    for message in &session.messages {
+        let role_label = match message.role {
+            MessageRole::User => "**User**",
+            MessageRole::Assistant => "**Assistant**",
+            MessageRole::System => "**System**",
+        };
+
+        output.push_str(&format!("### {} ({})\n\n", role_label, message.timestamp.format("%H:%M:%S")));
+        output.push_str(&message.content);
+        output.push_str("\n\n---\n\n");
+    }
+
+    // Summary if available
+    if let Some(ref summary) = session.summary {
+        output.push_str("## Summary\n\n");
+        output.push_str(summary);
+        output.push('\n');
+    }
+
+    output
+}
+
+fn export_to_html(session: &ChatSession) -> String {
+    let mut output = String::new();
+
+    output.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
+    output.push_str("<meta charset=\"UTF-8\">\n");
+    output.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n");
+    output.push_str(&format!("<title>{}</title>\n", html_escape(&session.display_title())));
+    output.push_str("<style>\n");
+    output.push_str("body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f5f5f5; }\n");
+    output.push_str(".header { background: #fff; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }\n");
+    output.push_str(".message { background: #fff; padding: 15px; border-radius: 8px; margin-bottom: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }\n");
+    output.push_str(".message.user { border-left: 4px solid #007bff; }\n");
+    output.push_str(".message.assistant { border-left: 4px solid #28a745; }\n");
+    output.push_str(".message.system { border-left: 4px solid #6c757d; }\n");
+    output.push_str(".role { font-weight: bold; margin-bottom: 8px; }\n");
+    output.push_str(".timestamp { color: #6c757d; font-size: 0.9em; }\n");
+    output.push_str(".content { white-space: pre-wrap; line-height: 1.6; }\n");
+    output.push_str("pre { background: #f8f9fa; padding: 10px; border-radius: 4px; overflow-x: auto; }\n");
+    output.push_str("code { background: #f8f9fa; padding: 2px 6px; border-radius: 3px; }\n");
+    output.push_str("</style>\n</head>\n<body>\n");
+
+    // Header
+    output.push_str("<div class=\"header\">\n");
+    output.push_str(&format!("<h1>{}</h1>\n", html_escape(&session.display_title())));
+    output.push_str(&format!("<p><strong>Created:</strong> {}</p>\n", session.created_at.format("%Y-%m-%d %H:%M:%S UTC")));
+    output.push_str(&format!("<p><strong>Updated:</strong> {}</p>\n", session.updated_at.format("%Y-%m-%d %H:%M:%S UTC")));
+
+    if let Some(ref project) = session.project_path {
+        output.push_str(&format!("<p><strong>Project:</strong> {}</p>\n", html_escape(project)));
+    }
+    if let Some(ref tool) = session.tool {
+        output.push_str(&format!("<p><strong>Tool:</strong> {}</p>\n", html_escape(tool.display_name())));
+    }
+    output.push_str(&format!("<p><strong>Messages:</strong> {}</p>\n", session.messages.len()));
+    output.push_str("</div>\n");
+
+    // Messages
+    for message in &session.messages {
+        let (role_class, role_label) = match message.role {
+            MessageRole::User => ("user", "User"),
+            MessageRole::Assistant => ("assistant", "Assistant"),
+            MessageRole::System => ("system", "System"),
+        };
+
+        output.push_str(&format!("<div class=\"message {}\">\n", role_class));
+        output.push_str(&format!(
+            "<div class=\"role\">{} <span class=\"timestamp\">({})</span></div>\n",
+            role_label,
+            message.timestamp.format("%H:%M:%S")
+        ));
+        output.push_str(&format!("<div class=\"content\">{}</div>\n", html_escape(&message.content)));
+        output.push_str("</div>\n");
+    }
+
+    output.push_str("</body>\n</html>");
+    output
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Export multiple sessions
+pub fn export_sessions(sessions: &[ChatSession], format: ExportFormat) -> String {
+    match format {
+        ExportFormat::Json => {
+            serde_json::to_string_pretty(sessions).unwrap_or_else(|_| "[]".to_string())
+        }
+        ExportFormat::Markdown => {
+            sessions.iter()
+                .map(|s| export_to_markdown(s))
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n")
+        }
+        ExportFormat::Html => {
+            let mut output = String::new();
+            output.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
+            output.push_str("<meta charset=\"UTF-8\">\n");
+            output.push_str("<title>Chat History Export</title>\n");
+            output.push_str("<style>\n");
+            output.push_str("body { font-family: sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }\n");
+            output.push_str(".session { border: 1px solid #ddd; margin-bottom: 20px; padding: 15px; border-radius: 8px; }\n");
+            output.push_str("</style>\n</head>\n<body>\n");
+            output.push_str(&format!("<h1>Chat History ({} sessions)</h1>\n", sessions.len()));
+
+            for session in sessions {
+                output.push_str("<div class=\"session\">\n");
+                output.push_str(&format!("<h2>{}</h2>\n", html_escape(&session.display_title())));
+                output.push_str(&format!("<p>{} messages | {}</p>\n",
+                    session.messages.len(),
+                    session.updated_at.format("%Y-%m-%d")
+                ));
+                output.push_str("</div>\n");
+            }
+
+            output.push_str("</body>\n</html>");
+            output
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

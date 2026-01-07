@@ -3,9 +3,11 @@ pub mod models;
 pub mod crypto;
 pub mod context;
 pub mod updater;
+pub mod features;
 
 pub use protocol::{
     ClientMessage, ServerMessage, OutputType, ToolInfo, SwitchReason, ErrorCode,
+    ExportFormat, ToolHealthInfo, ToolMetrics, CacheStats,
     encode_message, decode_message, frame_message,
     PROTOCOL_VERSION, MAX_MESSAGE_SIZE,
 };
@@ -20,7 +22,17 @@ pub use context::{
     Message, MessageRole, ChatSession, CodeReference,
     TransferContext, HistoryEntry, SummarizerConfig,
     truncate_smart, summarize_messages, create_transfer_context,
-    generate_title,
+    generate_title, export_session, export_sessions,
+};
+
+pub use features::{
+    RateLimiter, RateLimitConfig, RateLimitResult,
+    ResponseCache, CacheConfig,
+    QuotaTracker, QuotaConfig, QuotaResult, QuotaStatus,
+    HealthChecker, HealthCheckConfig,
+    MetricsCollector, ServerMetrics,
+    ContextWindowManager, ContextWindowConfig, TokenEstimationMethod, PromptValidation,
+    PluginValidator, PluginValidationConfig, PluginValidationError,
 };
 
 pub use updater::{

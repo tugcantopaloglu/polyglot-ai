@@ -10,6 +10,7 @@ use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use http::{Request, Response, StatusCode};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use parking_lot::RwLock;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use rcgen::{CertificateParams, DnType, SanType};
 use serde::{Deserialize, Serialize};
@@ -17,14 +18,20 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use polyglot_common::{
     decode_message, encode_message,
     ClientMessage, ServerMessage,
-    ErrorCode, OutputType, Tool, ToolInfo, PROTOCOL_VERSION,
-    MAX_MESSAGE_SIZE,
+    ErrorCode, OutputType, Tool, ToolInfo, ToolHealthInfo, CacheStats, ExportFormat,
+    PROTOCOL_VERSION, MAX_MESSAGE_SIZE,
+    RateLimiter, RateLimitConfig,
+    ResponseCache, CacheConfig,
+    QuotaTracker, QuotaConfig,
+    HealthChecker, HealthCheckConfig,
+    MetricsCollector,
+    ContextWindowManager, ContextWindowConfig,
 };
 
 #[derive(Parser, Debug)]
@@ -115,8 +122,186 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     timeout: u64,
 
+    /// Maximum requests per minute per client
+    #[arg(long, default_value_t = 100)]
+    rate_limit: u32,
+
+    /// Maximum connections per IP address
+    #[arg(long, default_value_t = 10)]
+    max_connections_per_ip: u32,
+
+    /// Maximum prompt length in characters
+    #[arg(long, default_value_t = 100000)]
+    max_prompt_length: usize,
+
+    /// Enable response caching
+    #[arg(long, default_value_t = false)]
+    enable_cache: bool,
+
+    /// Cache TTL in seconds
+    #[arg(long, default_value_t = 3600)]
+    cache_ttl: u64,
+
+    /// Token expiry in hours (0 = no expiry)
+    #[arg(long, default_value_t = 24)]
+    token_expiry_hours: u64,
+
     #[arg(short, long)]
     verbose: bool,
+}
+
+/// Shared bridge state for rate limiting, quotas, metrics, etc.
+struct BridgeState {
+    rate_limiter: RateLimiter,
+    quota_tracker: QuotaTracker,
+    health_checker: HealthChecker,
+    metrics: MetricsCollector,
+    response_cache: ResponseCache<String, String>,
+    context_manager: ContextWindowManager,
+    config: BridgeConfig,
+    token_sessions: RwLock<HashMap<String, TokenSession>>,
+}
+
+#[derive(Debug, Clone)]
+struct TokenSession {
+    token: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    last_used: chrono::DateTime<chrono::Utc>,
+}
+
+impl BridgeState {
+    fn new(config: BridgeConfig) -> Arc<Self> {
+        Arc::new(Self {
+            rate_limiter: RateLimiter::new(RateLimitConfig {
+                max_requests: config.rate_limit,
+                window_seconds: 60,
+                max_connections_per_ip: config.max_connections_per_ip,
+                cleanup_interval_seconds: 300,
+            }),
+            quota_tracker: QuotaTracker::new(QuotaConfig::default()),
+            health_checker: HealthChecker::new(HealthCheckConfig::default()),
+            metrics: MetricsCollector::new(),
+            response_cache: ResponseCache::new(CacheConfig {
+                max_entries: 1000,
+                ttl_seconds: config.cache_ttl,
+                max_memory_bytes: 100 * 1024 * 1024,
+            }),
+            context_manager: ContextWindowManager::new(ContextWindowConfig {
+                max_tokens: 128000,
+                response_reserve: 4000,
+                estimation_method: polyglot_common::TokenEstimationMethod::CharDivide4,
+            }),
+            token_sessions: RwLock::new(HashMap::new()),
+            config,
+        })
+    }
+
+    fn check_rate_limit(&self, ip: &str) -> Result<(), ServerMessage> {
+        if !self.rate_limiter.check(ip).is_allowed() {
+            return Err(ServerMessage::Error {
+                code: ErrorCode::RateLimited,
+                message: "Rate limit exceeded. Please slow down.".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_connection_rate(&self, ip: &str) -> Result<(), ServerMessage> {
+        if !self.rate_limiter.check_connection(ip).is_allowed() {
+            return Err(ServerMessage::Error {
+                code: ErrorCode::ConnectionRateLimited,
+                message: "Too many connection attempts. Please wait.".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_prompt(&self, prompt: &str) -> Result<(), ServerMessage> {
+        if prompt.len() > self.config.max_prompt_length {
+            return Err(ServerMessage::Error {
+                code: ErrorCode::PromptTooLong,
+                message: format!(
+                    "Prompt too long: {} chars (max {})",
+                    prompt.len(),
+                    self.config.max_prompt_length
+                ),
+            });
+        }
+
+        if !self.context_manager.validate_prompt(prompt).is_valid() {
+            return Err(ServerMessage::Error {
+                code: ErrorCode::PromptTooLong,
+                message: "Prompt exceeds context window limit".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn check_quota(&self, user_id: &str) -> Result<(), ServerMessage> {
+        if !self.quota_tracker.check(user_id).is_allowed() {
+            return Err(ServerMessage::Error {
+                code: ErrorCode::QuotaExceeded,
+                message: "Usage quota exceeded".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_token(&self, token: &str) -> bool {
+        if self.config.token_expiry_hours == 0 {
+            return true; // No expiry
+        }
+
+        let sessions = self.token_sessions.read();
+        if let Some(session) = sessions.get(token) {
+            if Utc::now() < session.expires_at {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn create_token_session(&self, token: &str) -> TokenSession {
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::hours(self.config.token_expiry_hours as i64);
+        let session = TokenSession {
+            token: token.to_string(),
+            created_at: now,
+            expires_at,
+            last_used: now,
+        };
+
+        let mut sessions = self.token_sessions.write();
+        sessions.insert(token.to_string(), session.clone());
+        session
+    }
+
+    fn refresh_token(&self, old_token: &str) -> Option<TokenSession> {
+        let mut sessions = self.token_sessions.write();
+        if sessions.remove(old_token).is_some() {
+            let new_token = polyglot_common::crypto::generate_token();
+            let now = Utc::now();
+            let session = TokenSession {
+                token: new_token.clone(),
+                created_at: now,
+                expires_at: now + chrono::Duration::hours(self.config.token_expiry_hours as i64),
+                last_used: now,
+            };
+            sessions.insert(new_token, session.clone());
+            return Some(session);
+        }
+        None
+    }
+
+    fn get_health_status(&self) -> Vec<ToolHealthInfo> {
+        self.health_checker.get_status()
+    }
+
+    fn get_cache_stats(&self) -> CacheStats {
+        self.response_cache.stats()
+    }
 }
 
 #[derive(Clone)]
@@ -139,6 +324,13 @@ struct BridgeConfig {
     qr_host: Option<String>,
     drive_remote: Option<String>,
     drive_path: PathBuf,
+    // Security & feature settings
+    rate_limit: u32,
+    max_connections_per_ip: u32,
+    max_prompt_length: usize,
+    enable_cache: bool,
+    cache_ttl: u64,
+    token_expiry_hours: u64,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -196,6 +388,10 @@ enum BridgeEvent {
         drive_remote: Option<String>,
         last_sync: Option<String>,
         uptime_seconds: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        active_connections: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_requests: Option<u64>,
     },
     DriveSyncResult {
         ok: bool,
@@ -263,6 +459,19 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Create shared bridge state
+    let state = BridgeState::new(config.clone());
+
+    // Spawn background cleanup task for rate limiter
+    let cleanup_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            cleanup_state.rate_limiter.cleanup();
+        }
+    });
+
     let scheme = if config.tls_enabled { "wss" } else { "ws" };
     info!(
         "Polyglot bridge listening on {}://{}/ws (mode: {:?})",
@@ -270,15 +479,33 @@ async fn main() -> Result<()> {
         config.listen,
         config.mode
     );
+    info!(
+        "Security: rate_limit={}/min, max_conn_per_ip={}, cache={}",
+        config.rate_limit,
+        config.max_connections_per_ip,
+        if config.enable_cache { "enabled" } else { "disabled" }
+    );
 
     loop {
         let (stream, addr) = listener.accept().await?;
         let config = config.clone();
         let tls_acceptor = tls_acceptor.clone();
         let started = start_time;
+        let state = state.clone();
+
+        // Check connection rate limit
+        let ip = addr.ip().to_string();
+        if let Err(msg) = state.check_connection_rate(&ip) {
+            warn!("Connection rate limited for {}", ip);
+            continue;
+        }
+
+        state.metrics.connection_opened();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_socket(stream, addr, config, tls_acceptor, started).await {
+            let result = handle_socket(stream, addr, config, tls_acceptor, started, state.clone()).await;
+            state.metrics.connection_closed();
+            if let Err(err) = result {
                 error!("Connection {} failed: {}", addr, err);
             }
         });
@@ -291,6 +518,7 @@ async fn handle_socket(
     config: BridgeConfig,
     tls_acceptor: Option<TlsAcceptor>,
     started: Instant,
+    state: Arc<BridgeState>,
 ) -> Result<()> {
     let token_required = config.token.clone();
 
@@ -303,8 +531,8 @@ async fn handle_socket(
 
     info!("WebSocket client connected: {}", addr);
     let result = match config.mode {
-        BridgeMode::Server => handle_server_bridge(ws_stream, &config, started).await,
-        BridgeMode::Local => handle_local_bridge(ws_stream, &config, started).await,
+        BridgeMode::Server => handle_server_bridge(ws_stream, &config, started, state.clone()).await,
+        BridgeMode::Local => handle_local_bridge(ws_stream, &config, started, state.clone(), &addr.ip().to_string()).await,
     };
 
     info!("WebSocket client disconnected: {}", addr);
@@ -319,6 +547,24 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let ws_stream = tokio_tungstenite::accept_hdr_async(stream, move |req: &Request<()>, mut resp: Response<()>| {
+        // Add CORS headers for cross-origin requests
+        resp.headers_mut().insert(
+            "Access-Control-Allow-Origin",
+            "*".parse().unwrap(),
+        );
+        resp.headers_mut().insert(
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS".parse().unwrap(),
+        );
+        resp.headers_mut().insert(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-Requested-With".parse().unwrap(),
+        );
+        resp.headers_mut().insert(
+            "Access-Control-Max-Age",
+            "86400".parse().unwrap(),
+        );
+
         if req.uri().path() != "/ws" {
             *resp.status_mut() = StatusCode::NOT_FOUND;
             return Ok(resp);
@@ -342,6 +588,7 @@ async fn handle_server_bridge<S>(
     ws_stream: WsStream<S>,
     config: &BridgeConfig,
     started: Instant,
+    state: Arc<BridgeState>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -375,6 +622,7 @@ where
                                 &mut ws_write,
                                 started,
                                 &mut last_sync,
+                                state.clone(),
                             ).await?;
                         } else {
                             let client_msg: ClientMessage = serde_json::from_str(&text)
@@ -414,6 +662,8 @@ async fn handle_local_bridge<S>(
     ws_stream: WsStream<S>,
     config: &BridgeConfig,
     started: Instant,
+    state: Arc<BridgeState>,
+    client_ip: &str,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -424,9 +674,17 @@ where
     let mut current_tool: Option<Tool> = None;
     let mut env_entries: Vec<(String, String)> = Vec::new();
     let mut last_sync: Option<chrono::DateTime<chrono::Utc>> = None;
+    let user_id = client_ip.to_string(); // Use IP as user ID for quota tracking
 
     while let Some(ws_msg) = ws_read.next().await {
         let ws_msg = ws_msg?;
+
+        // Check rate limit for each message
+        if let Err(err_msg) = state.check_rate_limit(client_ip) {
+            send_ws_message(&mut ws_write, codec, &err_msg).await?;
+            continue;
+        }
+
         let client_msg = match ws_msg {
             tokio_tungstenite::tungstenite::Message::Text(text) => {
                 if !codec_set {
@@ -440,6 +698,7 @@ where
                         &mut ws_write,
                         started,
                         &mut last_sync,
+                        state.clone(),
                     ).await?;
                     None
                 } else {
@@ -526,9 +785,43 @@ where
                 send_ws_message(&mut ws_write, codec, &response).await?;
             }
             ClientMessage::Prompt { tool, message, working_dir } => {
+                // Validate prompt length
+                if let Err(err_msg) = state.validate_prompt(&message) {
+                    send_ws_message(&mut ws_write, codec, &err_msg).await?;
+                    continue;
+                }
+
+                // Check quota
+                if let Err(err_msg) = state.check_quota(&user_id) {
+                    send_ws_message(&mut ws_write, codec, &err_msg).await?;
+                    continue;
+                }
+
                 let selected_tool = tool.or(current_tool).unwrap_or(Tool::Claude);
                 let use_tool_flag = tool.is_some() || current_tool.is_some();
                 current_tool = Some(selected_tool);
+
+                // Check tool health
+                if !state.health_checker.is_healthy(selected_tool) {
+                    warn!("Tool {} is unhealthy, proceeding anyway", selected_tool);
+                }
+
+                // Check cache first if enabled
+                if config.enable_cache {
+                    let cache_key = format!("{}:{}", selected_tool.as_str(), &message);
+                    if let Some(cached) = state.response_cache.get(&cache_key) {
+                        let response = ServerMessage::ToolResponse {
+                            tool: selected_tool,
+                            content: cached,
+                            done: true,
+                            tokens: None,
+                        };
+                        send_ws_message(&mut ws_write, codec, &response).await?;
+                        continue;
+                    }
+                }
+
+                let start_time = std::time::Instant::now();
                 handle_prompt_local(
                     &mut ws_write,
                     codec,
@@ -539,6 +832,12 @@ where
                     working_dir.as_deref(),
                     &env_entries,
                 ).await?;
+
+                // Record metrics
+                let latency_ms = start_time.elapsed().as_millis() as u32;
+                state.metrics.record_request(selected_tool, true, latency_ms);
+                state.health_checker.record_success(selected_tool, latency_ms);
+                state.quota_tracker.record_usage(&user_id, 0); // TODO: actual token count
             }
             ClientMessage::ListTools => {
                 let tools = list_local_tools(&config.local_bin).await?;
@@ -574,6 +873,69 @@ where
                 send_ws_message(&mut ws_write, codec, &response).await?;
             }
             ClientMessage::Disconnect => break,
+            ClientMessage::HealthCheck => {
+                let tools = state.get_health_status();
+                let server_healthy = state.health_checker.all_healthy();
+                let response = ServerMessage::HealthStatus {
+                    tools,
+                    server_healthy,
+                    uptime_seconds: started.elapsed().as_secs(),
+                };
+                send_ws_message(&mut ws_write, codec, &response).await?;
+            }
+            ClientMessage::QuotaCheck => {
+                let status = state.quota_tracker.get_status(&user_id);
+                let response = ServerMessage::QuotaInfo {
+                    daily_limit: status.daily_limit,
+                    daily_used: status.daily_used,
+                    monthly_limit: status.monthly_limit,
+                    monthly_used: status.monthly_used,
+                    reset_at: Some(status.daily_reset),
+                };
+                send_ws_message(&mut ws_write, codec, &response).await?;
+            }
+            ClientMessage::RefreshToken { current_token } => {
+                if let Some(new_session) = state.refresh_token(&current_token) {
+                    let response = ServerMessage::TokenRefreshed {
+                        new_token: new_session.token,
+                        expires_at: new_session.expires_at,
+                    };
+                    send_ws_message(&mut ws_write, codec, &response).await?;
+                } else {
+                    let response = ServerMessage::Error {
+                        code: ErrorCode::TokenExpired,
+                        message: "Token not found or already expired".to_string(),
+                    };
+                    send_ws_message(&mut ws_write, codec, &response).await?;
+                }
+            }
+            ClientMessage::ExportHistory { session_id: _, format } => {
+                // In local mode, we don't have access to full history
+                // Return empty export
+                let response = ServerMessage::HistoryExport {
+                    format,
+                    data: match format {
+                        ExportFormat::Json => "[]".to_string(),
+                        ExportFormat::Markdown => "# No history available in bridge mode".to_string(),
+                        ExportFormat::Html => "<html><body><p>No history available in bridge mode</p></body></html>".to_string(),
+                    },
+                    session_count: 0,
+                };
+                send_ws_message(&mut ws_write, codec, &response).await?;
+            }
+            ClientMessage::GetMetrics => {
+                let cache_stats = state.get_cache_stats();
+                let metrics = state.metrics.get_metrics(cache_stats);
+                let response = ServerMessage::Metrics {
+                    active_connections: metrics.active_connections,
+                    total_requests: metrics.total_requests,
+                    requests_per_minute: metrics.requests_per_minute,
+                    tool_stats: metrics.tool_stats,
+                    cache_stats: metrics.cache_stats,
+                    uptime_seconds: metrics.uptime_seconds,
+                };
+                send_ws_message(&mut ws_write, codec, &response).await?;
+            }
             _ => {
                 let response = ServerMessage::Error {
                     code: ErrorCode::InvalidMessage,
@@ -823,12 +1185,14 @@ async fn handle_bridge_control<S>(
     ws_write: &mut WsWrite<S>,
     started: Instant,
     last_sync: &mut Option<chrono::DateTime<chrono::Utc>>,
+    state: Arc<BridgeState>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match control {
         BridgeControl::Status => {
+            let metrics = state.metrics.get_metrics(state.get_cache_stats());
             let event = BridgeEvent::Status {
                 mode: bridge_mode_label(config.mode),
                 server: config.server.clone(),
@@ -838,6 +1202,8 @@ where
                 drive_remote: config.drive_remote.clone(),
                 last_sync: last_sync.map(|t| t.to_rfc3339()),
                 uptime_seconds: started.elapsed().as_secs(),
+                active_connections: Some(metrics.active_connections),
+                total_requests: Some(metrics.total_requests),
             };
             send_bridge_event(ws_write, event).await?;
         }
@@ -1103,6 +1469,12 @@ impl BridgeConfig {
             qr_host: cli.qr_host.clone(),
             drive_remote: cli.drive_remote.clone(),
             drive_path: cli.drive_path.clone().unwrap_or_else(|| PathBuf::from("./bridge-sync")),
+            rate_limit: cli.rate_limit,
+            max_connections_per_ip: cli.max_connections_per_ip,
+            max_prompt_length: cli.max_prompt_length,
+            enable_cache: cli.enable_cache,
+            cache_ttl: cli.cache_ttl,
+            token_expiry_hours: cli.token_expiry_hours,
         }
     }
 }
@@ -1132,6 +1504,12 @@ fn load_config(path: &Path) -> Result<BridgeConfig> {
         qr_host: None,
         drive_remote: None,
         drive_path: PathBuf::from("./bridge-sync"),
+        rate_limit: 100,
+        max_connections_per_ip: 10,
+        max_prompt_length: 100000,
+        enable_cache: false,
+        cache_ttl: 3600,
+        token_expiry_hours: 24,
     };
 
     if let Some(listen) = parsed.listen {

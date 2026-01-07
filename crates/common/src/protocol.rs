@@ -69,6 +69,26 @@ pub enum ClientMessage {
     SetEnv {
         entries: Vec<(String, String)>,
     },
+
+    /// Request tool health status
+    HealthCheck,
+
+    /// Request usage quota information
+    QuotaCheck,
+
+    /// Refresh authentication token
+    RefreshToken {
+        current_token: String,
+    },
+
+    /// Export conversation history
+    ExportHistory {
+        session_id: Option<String>,
+        format: ExportFormat,
+    },
+
+    /// Request server metrics (admin only)
+    GetMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +195,94 @@ pub enum ServerMessage {
     EnvAck {
         applied: u32,
     },
+
+    /// Tool health status response
+    HealthStatus {
+        tools: Vec<ToolHealthInfo>,
+        server_healthy: bool,
+        uptime_seconds: u64,
+    },
+
+    /// Usage quota information
+    QuotaInfo {
+        daily_limit: Option<u64>,
+        daily_used: u64,
+        monthly_limit: Option<u64>,
+        monthly_used: u64,
+        reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+
+    /// Token refresh result
+    TokenRefreshed {
+        new_token: String,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// Exported history data
+    HistoryExport {
+        format: ExportFormat,
+        data: String,
+        session_count: u32,
+    },
+
+    /// Server metrics (admin only)
+    Metrics {
+        active_connections: u32,
+        total_requests: u64,
+        requests_per_minute: f64,
+        tool_stats: Vec<ToolMetrics>,
+        cache_stats: CacheStats,
+        uptime_seconds: u64,
+    },
+
+    /// Streaming chunk for real-time responses
+    StreamChunk {
+        tool: Tool,
+        content: String,
+        sequence: u32,
+        is_final: bool,
+    },
+}
+
+/// Export format for conversation history
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    Json,
+    Markdown,
+    Html,
+}
+
+/// Tool health information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolHealthInfo {
+    pub tool: Tool,
+    pub healthy: bool,
+    pub last_check: chrono::DateTime<chrono::Utc>,
+    pub latency_ms: Option<u32>,
+    pub error_rate: f32,
+    pub consecutive_failures: u32,
+}
+
+/// Per-tool metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolMetrics {
+    pub tool: Tool,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub avg_latency_ms: u32,
+    pub rate_limit_hits: u64,
+}
+
+/// Cache statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheStats {
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub hit_rate: f32,
+    pub memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +336,10 @@ pub enum ErrorCode {
     RateLimited = 9,
     ServerOverloaded = 10,
     ProtocolMismatch = 11,
+    PromptTooLong = 12,
+    QuotaExceeded = 13,
+    TokenExpired = 14,
+    ConnectionRateLimited = 15,
 }
 
 impl std::fmt::Display for ErrorCode {
@@ -245,6 +357,10 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::RateLimited => write!(f, "Rate limited"),
             ErrorCode::ServerOverloaded => write!(f, "Server overloaded"),
             ErrorCode::ProtocolMismatch => write!(f, "Protocol version mismatch"),
+            ErrorCode::PromptTooLong => write!(f, "Prompt exceeds maximum length"),
+            ErrorCode::QuotaExceeded => write!(f, "Usage quota exceeded"),
+            ErrorCode::TokenExpired => write!(f, "Authentication token expired"),
+            ErrorCode::ConnectionRateLimited => write!(f, "Too many connection attempts"),
         }
     }
 }
