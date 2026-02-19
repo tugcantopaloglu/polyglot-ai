@@ -1,7 +1,5 @@
 //! Client configuration
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use polyglot_common::SyncMode;

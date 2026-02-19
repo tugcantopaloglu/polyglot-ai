@@ -15,6 +15,8 @@ pub struct ServerConfig {
     pub storage: StorageSettings,
     #[serde(default)]
     pub updates: UpdateSettings,
+    #[serde(default)]
+    pub webhooks: Vec<polyglot_common::WebhookConfig>,
 }
 
 impl Default for ServerConfig {
@@ -25,6 +27,7 @@ impl Default for ServerConfig {
             tools: ToolsSettings::default(),
             storage: StorageSettings::default(),
             updates: UpdateSettings::default(),
+            webhooks: Vec::new(),
         }
     }
 }

@@ -135,9 +135,49 @@ struct ServerState {
     health_checker: polyglot_common::HealthChecker,
     metrics: polyglot_common::MetricsCollector,
     quota_tracker: polyglot_common::QuotaTracker,
+    api_key_manager: polyglot_common::ApiKeyManager,
     session_env: RwLock<HashMap<Uuid, Vec<(String, String)>>>,
     start_time: std::time::Instant,
     shutdown: AtomicBool,
+}
+
+impl ServerState {
+    /// Fire webhook notifications for an event
+    fn fire_webhook(&self, event: polyglot_common::WebhookEvent, data: serde_json::Value) {
+        let webhooks: Vec<_> = self.config.webhooks.iter()
+            .filter(|w| w.events.contains(&event))
+            .cloned()
+            .collect();
+
+        if webhooks.is_empty() {
+            return;
+        }
+
+        let payload = polyglot_common::WebhookPayload::new(event, data);
+
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            for webhook in webhooks {
+                let body = match serde_json::to_string(&payload) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+
+                let mut req = client.post(&webhook.url)
+                    .header("Content-Type", "application/json")
+                    .timeout(std::time::Duration::from_millis(webhook.timeout_ms));
+
+                if let Some(ref secret) = webhook.secret {
+                    let sig = polyglot_common::compute_webhook_signature(&body, secret);
+                    req = req.header("X-Webhook-Signature", sig);
+                }
+
+                if let Err(e) = req.body(body).send().await {
+                    debug!("Webhook delivery failed for {}: {}", webhook.url, e);
+                }
+            }
+        });
+    }
 }
 
 #[tokio::main]
@@ -234,6 +274,7 @@ async fn start_server(config: ServerConfig) -> Result<()> {
     let quota_tracker = polyglot_common::QuotaTracker::new(
         polyglot_common::QuotaConfig::default()
     );
+    let api_key_manager = polyglot_common::ApiKeyManager::new(&jwt_secret);
 
     let state = Arc::new(ServerState {
         config: config.clone(),
@@ -246,6 +287,7 @@ async fn start_server(config: ServerConfig) -> Result<()> {
         health_checker,
         metrics,
         quota_tracker,
+        api_key_manager,
         session_env: RwLock::new(HashMap::new()),
         start_time: std::time::Instant::now(),
         shutdown: AtomicBool::new(false),
@@ -274,7 +316,10 @@ async fn start_server(config: ServerConfig) -> Result<()> {
 
             loop {
                 if let Ok((mut stream, _)) = listener.accept().await {
-                    let metrics_data = metrics_state.metrics.get_metrics();
+                    let cache_stats = polyglot_common::CacheStats {
+                        entries: 0, hits: 0, misses: 0, hit_rate: 0.0, memory_bytes: 0,
+                    };
+                    let metrics_data = metrics_state.metrics.get_metrics(cache_stats);
                     let body = exporter.format(&metrics_data);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
@@ -548,6 +593,11 @@ async fn handle_message(
         ClientMessage::Prompt { tool, message, working_dir } => {
             let tool = tool.or(*current_tool).unwrap_or(state.config.tools.default_tool);
 
+            // Create trace context for this request
+            let trace_ctx = polyglot_common::TraceContext::new();
+            let tool_span_ctx = trace_ctx.child();
+            debug!("Request trace: {} tool_span: {}", trace_ctx.to_traceparent(), tool_span_ctx.to_traceparent());
+
             let session_env = session_id
                 .and_then(|sid| state.session_env.read().get(&sid).cloned())
                 .unwrap_or_default();
@@ -567,6 +617,8 @@ async fn handle_message(
             let state_ref = state.clone();
 
             tokio::spawn(async move {
+                let mut span = polyglot_common::Span::new("tool_execution", tool_span_ctx)
+                    .with_attribute("tool", tool.as_str());
                 let execute_handle = tokio::spawn({
                     let tool_manager = tool_manager.clone();
                     async move {
@@ -634,12 +686,20 @@ async fn handle_message(
                         ToolOutput::Error(e) => {
                             state_ref.metrics.record_request(tool, false, 0);
                             state_ref.health_checker.record_failure(tool);
+                            state_ref.fire_webhook(
+                                polyglot_common::WebhookEvent::RequestFailed,
+                                serde_json::json!({"tool": tool.as_str(), "error": &e}),
+                            );
                             response_tx_clone.send(ServerMessage::Error {
                                 code: ErrorCode::ToolError,
                                 message: e,
                             }).await.ok();
                         }
                         ToolOutput::RateLimited => {
+                            state_ref.fire_webhook(
+                                polyglot_common::WebhookEvent::RateLimited,
+                                serde_json::json!({"tool": tool.as_str()}),
+                            );
                             if let Some(next_tool) = tool_manager.get_next_tool(tool).await {
                                 response_tx_clone.send(ServerMessage::ToolSwitchNotice {
                                     from: tool,
@@ -658,8 +718,14 @@ async fn handle_message(
                 }
 
                 if let Err(e) = execute_handle.await {
+                    span.set_status(polyglot_common::SpanStatus::Error);
                     error!("Tool execution task failed: {}", e);
+                } else {
+                    span.set_status(polyglot_common::SpanStatus::Ok);
                 }
+                span.end();
+                debug!("Span completed: {} duration_ms={}", span.name,
+                    span.end_time.map(|e| (e - span.start_time).num_milliseconds()).unwrap_or(0));
             });
         }
 

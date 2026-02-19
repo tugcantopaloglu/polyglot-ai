@@ -171,6 +171,8 @@ async fn run_interactive(config: &ClientConfig) -> Result<()> {
     info!("Starting Polyglot-AI Client v{}", env!("CARGO_PKG_VERSION"));
 
     let mut app = App::new();
+    app.show_timestamps = config.ui.show_timestamps;
+    app.theme = tui::Theme::from_name(&config.ui.theme);
     app.add_output(OutputType::System, "Welcome to Polyglot-AI!".to_string());
     app.add_output(OutputType::System, format!("Connecting to {}...", config.connection.server_address));
 

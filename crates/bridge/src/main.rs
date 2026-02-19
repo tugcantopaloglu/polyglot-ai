@@ -34,6 +34,7 @@ use polyglot_common::{
     HealthChecker, HealthCheckConfig,
     MetricsCollector,
     ContextWindowManager, ContextWindowConfig,
+    LoadBalancer, LoadBalanceStrategy, ToolInstance,
     Database, AuditLogEntry, StoredSession,
 };
 
@@ -185,6 +186,7 @@ struct BridgeState {
     metrics: MetricsCollector,
     response_cache: ResponseCache<String, String>,
     context_manager: ContextWindowManager,
+    load_balancer: LoadBalancer,
     config: BridgeConfig,
     token_sessions: RwLock<HashMap<String, TokenSession>>,
     database: Option<Database>,
@@ -220,6 +222,20 @@ impl BridgeState {
             None
         };
 
+        let load_balancer = LoadBalancer::new(LoadBalanceStrategy::LeastConnections);
+        // Register a default instance for each tool
+        for tool in Tool::all() {
+            load_balancer.register(ToolInstance {
+                id: format!("{}-default", tool.as_str()),
+                tool: *tool,
+                endpoint: "local".to_string(),
+                weight: 1,
+                healthy: true,
+                active_connections: 0,
+                avg_response_time_ms: 0,
+            });
+        }
+
         Arc::new(Self {
             rate_limiter: RateLimiter::new(RateLimitConfig {
                 max_requests: config.rate_limit,
@@ -240,6 +256,7 @@ impl BridgeState {
                 response_reserve: 4000,
                 estimation_method: polyglot_common::TokenEstimationMethod::CharDivide4,
             }),
+            load_balancer,
             token_sessions: RwLock::new(HashMap::new()),
             database,
             config,
@@ -252,6 +269,12 @@ impl BridgeState {
             return requested;
         }
 
+        // Try load balancer first - if the requested tool has healthy instances, use it
+        if let Some(_instance) = self.load_balancer.select(requested) {
+            return requested;
+        }
+
+        // Fallback to health checker
         self.health_checker
             .get_tool_with_fallback(requested, Tool::all())
             .unwrap_or(requested)
