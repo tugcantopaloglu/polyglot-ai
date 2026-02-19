@@ -132,21 +132,21 @@ impl ToolAdapter for CursorAdapter {
             while let Ok(Some(line)) = lines.next_line().await {
                 if is_rate_limit_message(&line) {
                     rate_limited = true;
-                }
-                if output_tx_stderr.send(ToolOutput::Stderr(line)).await.is_err() {
-                    break;
+                    let _ = output_tx_stderr.send(ToolOutput::RateLimited).await;
+                } else {
+                    let _ = output_tx_stderr.send(ToolOutput::Stderr(line)).await;
                 }
             }
 
             rate_limited
         });
 
-        let (_, rate_limited) = tokio::try_join!(stdout_handle, stderr_handle)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let status = child.wait().await?;
+
+        let _ = stdout_handle.await;
+        let rate_limited = stderr_handle.await.unwrap_or(false);
 
         *self.current_process.lock() = None;
-
-        let status = child.wait().await?;
 
         if rate_limited {
             output_tx.send(ToolOutput::RateLimited).await.ok();
@@ -155,14 +155,12 @@ impl ToolAdapter for CursorAdapter {
 
         if status.success() {
             output_tx.send(ToolOutput::Done { tokens: None }).await.ok();
+            Ok(())
         } else {
-            output_tx.send(ToolOutput::Error(format!(
-                "Cursor CLI exited with code: {:?}",
-                status.code()
-            ))).await.ok();
+            let error_msg = format!("Cursor CLI exited with code: {:?}", status.code());
+            output_tx.send(ToolOutput::Error(error_msg.clone())).await.ok();
+            Err(ToolError::ExecutionFailed(error_msg))
         }
-
-        Ok(())
     }
 
     async fn cancel(&self) -> Result<(), ToolError> {
@@ -180,6 +178,7 @@ impl ToolAdapter for CursorAdapter {
                     .output();
             }
         }
+        *self.current_process.lock() = None;
         Ok(())
     }
 

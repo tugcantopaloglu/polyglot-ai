@@ -458,7 +458,7 @@ fn get_next_tool(inner: &LocalToolManagerInner, current: Tool) -> Option<Tool> {
 
     match inner.rotation_strategy {
         RotationStrategy::OnLimit | RotationStrategy::Priority => {
-            let priorities = [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::Copilot, Tool::Perplexity, Tool::Cursor];
+            let priorities = [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::Copilot, Tool::Perplexity, Tool::Cursor, Tool::Ollama];
             for tool in priorities {
                 if tool != current {
                     if let Some(stats) = usage.get(&tool) {
@@ -470,7 +470,7 @@ fn get_next_tool(inner: &LocalToolManagerInner, current: Tool) -> Option<Tool> {
             }
         }
         RotationStrategy::RoundRobin => {
-            let all_tools = [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::Copilot, Tool::Perplexity, Tool::Cursor];
+            let all_tools = [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::Copilot, Tool::Perplexity, Tool::Cursor, Tool::Ollama];
             let current_idx = all_tools.iter().position(|t| *t == current).unwrap_or(0);
 
             for i in 1..all_tools.len() {

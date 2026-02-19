@@ -101,9 +101,7 @@ impl App {
             content,
         });
 
-        if self.output.len() > 0 {
-            self.scroll_offset = self.output.len().saturating_sub(1);
-        }
+        self.scroll_offset = self.output.len().saturating_sub(1);
     }
 
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<AppAction> {
@@ -335,8 +333,7 @@ fn run_event_loop(
         if event::poll(Duration::from_millis(100))? {
             while event::poll(Duration::from_millis(0))? {
                 if let Event::Key(key) = event::read()? {
-                    if let Some(_action) = app.handle_key(key.code, key.modifiers) {
-                    }
+                    let _ = app.handle_key(key.code, key.modifiers);
                 }
             }
         }
@@ -401,10 +398,18 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_chat_view(f: &mut Frame, area: Rect, app: &App) {
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let total = app.output.len();
+    let start = if total > visible_height {
+        app.scroll_offset.min(total.saturating_sub(visible_height))
+    } else {
+        0
+    };
+
     let items: Vec<ListItem> = app.output
         .iter()
-        .skip(app.scroll_offset.saturating_sub(area.height as usize))
-        .take(area.height as usize)
+        .skip(start)
+        .take(visible_height)
         .map(|line| {
             let style = match line.line_type {
                 OutputType::User => Style::default().fg(Color::Green),
@@ -611,11 +616,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
     let input = Paragraph::new(app.input.as_str())
         .block(Block::default().borders(Borders::ALL).title("Input"))
-        .scroll((0, scroll_offset as u16));
+        .scroll((0, scroll_offset.min(u16::MAX as usize) as u16));
     f.render_widget(input, area);
 
     f.set_cursor_position((
-        area.x + visible_cursor_pos as u16 + 1,
+        area.x.saturating_add(visible_cursor_pos.min(u16::MAX as usize) as u16).saturating_add(1),
         area.y + 1,
     ));
 }

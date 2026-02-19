@@ -16,7 +16,7 @@ use parking_lot::RwLock;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use rcgen::{CertificateParams, DnType, SanType};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio_rustls::TlsAcceptor;
@@ -396,7 +396,7 @@ impl BridgeState {
     fn refresh_token(&self, old_token: &str) -> Option<TokenSession> {
         let mut sessions = self.token_sessions.write();
         if sessions.remove(old_token).is_some() {
-            let new_token = polyglot_common::crypto::generate_token();
+            let new_token = polyglot_common::crypto::random_token(32);
             let now = Utc::now();
             let session = TokenSession {
                 token: new_token.clone(),
@@ -642,7 +642,7 @@ async fn main() -> Result<()> {
 
         // Check connection rate limit
         let ip = addr.ip().to_string();
-        if let Err(msg) = state.check_connection_rate(&ip) {
+        if let Err(_msg) = state.check_connection_rate(&ip) {
             warn!("Connection rate limited for {}", ip);
             continue;
         }
@@ -669,19 +669,31 @@ async fn handle_socket(
 ) -> Result<()> {
     let token_required = config.token.clone();
 
-    let ws_stream = if let Some(acceptor) = tls_acceptor {
+    if let Some(acceptor) = tls_acceptor {
         let tls_stream = acceptor.accept(stream).await?;
-        accept_ws(tls_stream, token_required).await?
+        let ws_stream = accept_ws(tls_stream, token_required).await?;
+        run_ws_connection(ws_stream, addr, &config, started, state).await
     } else {
-        accept_ws(stream, token_required).await?
-    };
+        let ws_stream = accept_ws(stream, token_required).await?;
+        run_ws_connection(ws_stream, addr, &config, started, state).await
+    }
+}
 
+async fn run_ws_connection<S>(
+    ws_stream: WsStream<S>,
+    addr: SocketAddr,
+    config: &BridgeConfig,
+    started: Instant,
+    state: Arc<BridgeState>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     info!("WebSocket client connected: {}", addr);
     let result = match config.mode {
-        BridgeMode::Server => handle_server_bridge(ws_stream, &config, started, state.clone()).await,
-        BridgeMode::Local => handle_local_bridge(ws_stream, &config, started, state.clone(), &addr.ip().to_string()).await,
+        BridgeMode::Server => handle_server_bridge(ws_stream, config, started, state.clone()).await,
+        BridgeMode::Local => handle_local_bridge(ws_stream, config, started, state.clone(), &addr.ip().to_string()).await,
     };
-
     info!("WebSocket client disconnected: {}", addr);
     result
 }
@@ -906,14 +918,23 @@ where
                     .filter(|(key, value)| {
                         // Reject keys with dangerous characters or patterns
                         !key.is_empty() &&
+                        key.len() <= 256 &&
                         key.chars().all(|c| c.is_alphanumeric() || c == '_') &&
                         !key.starts_with("LD_") &&
                         !key.starts_with("DYLD_") &&
                         key != "PATH" &&
+                        key != "HOME" &&
+                        key != "SHELL" &&
                         // Reject values with shell injection characters
+                        value.len() <= 8192 &&
                         !value.contains('\0') &&
                         !value.contains('`') &&
-                        !value.contains("$(")
+                        !value.contains("$(") &&
+                        !value.contains('|') &&
+                        !value.contains(';') &&
+                        !value.contains('&') &&
+                        !value.contains('\n') &&
+                        !value.contains('\r')
                     })
                     .collect();
                 let response = ServerMessage::EnvAck {
@@ -1829,20 +1850,21 @@ fn ensure_tls_files(config: &BridgeConfig) -> Result<()> {
 
     let mut params = CertificateParams::default();
     params.distinguished_name.push(DnType::CommonName, "polyglot-bridge");
-    params.subject_alt_names.push(SanType::DnsName("localhost".to_string()));
+    params.subject_alt_names.push(SanType::DnsName("localhost".try_into()?));
     params.subject_alt_names.push(SanType::IpAddress(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
 
     if let Some(host) = config.qr_host.as_ref() {
         if let Ok(ip) = host.parse::<IpAddr>() {
             params.subject_alt_names.push(SanType::IpAddress(ip));
         } else {
-            params.subject_alt_names.push(SanType::DnsName(host.clone()));
+            params.subject_alt_names.push(SanType::DnsName(host.as_str().try_into()?));
         }
     }
 
-    let cert = rcgen::Certificate::from_params(params)?;
-    std::fs::write(&config.tls_cert, cert.serialize_pem()?)?;
-    std::fs::write(&config.tls_key, cert.serialize_private_key_pem())?;
+    let key_pair = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+    std::fs::write(&config.tls_cert, cert.pem())?;
+    std::fs::write(&config.tls_key, key_pair.serialize_pem())?;
 
     Ok(())
 }

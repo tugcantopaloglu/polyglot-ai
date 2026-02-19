@@ -220,7 +220,10 @@ impl UsageTracker {
         let stats = stmt.query_map([start_date, end_date], |row| {
             Ok(DailyStats {
                 date: row.get(0)?,
-                tool: row.get::<_, String>(1)?.parse().unwrap_or(Tool::Claude),
+                tool: row.get::<_, String>(1)?.parse().unwrap_or_else(|_| {
+                    tracing::warn!("Unknown tool in daily_stats, defaulting to Claude");
+                    Tool::Claude
+                }),
                 total_requests: row.get::<_, i64>(2)? as u64,
                 total_tokens: row.get::<_, i64>(3)? as u64,
                 total_errors: row.get::<_, i64>(4)? as u64,

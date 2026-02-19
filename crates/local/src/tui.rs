@@ -583,12 +583,17 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_chat_view(f: &mut Frame, area: Rect, app: &App) {
     let visible_height = area.height.saturating_sub(2) as usize;
-    let start = app.scroll_offset.saturating_sub(visible_height);
+    let total = app.output.len();
+    let start = if total > visible_height {
+        app.scroll_offset.min(total.saturating_sub(visible_height))
+    } else {
+        0
+    };
 
     let items: Vec<ListItem> = app.output
         .iter()
         .skip(start)
-        .take(visible_height + 1)
+        .take(visible_height)
         .map(|line| {
             let style = match line.line_type {
                 OutputType::User => Style::default().fg(Color::Green),
@@ -666,7 +671,7 @@ fn draw_tools_view(f: &mut Frame, area: Rect, app: &App) {
     let paragraph = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title(" Available Tools [F2] "))
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll_offset as u16, 0));
+        .scroll((app.scroll_offset.min(u16::MAX as usize) as u16, 0));
     f.render_widget(paragraph, area);
 }
 
@@ -828,7 +833,7 @@ fn draw_usage_view(f: &mut Frame, area: Rect, app: &App) {
     let paragraph = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title(" Usage Statistics [F3] "))
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll_offset as u16, 0));
+        .scroll((app.scroll_offset.min(u16::MAX as usize) as u16, 0));
     f.render_widget(paragraph, area);
 }
 
@@ -894,7 +899,7 @@ fn draw_help_view(f: &mut Frame, area: Rect, app: &App) {
     let paragraph = Paragraph::new(help_text)
         .block(Block::default().borders(Borders::ALL).title(" Help [F5] "))
         .wrap(Wrap { trim: true })
-        .scroll((app.scroll_offset as u16, 0));
+        .scroll((app.scroll_offset.min(u16::MAX as usize) as u16, 0));
     f.render_widget(paragraph, area);
 }
 
@@ -985,7 +990,7 @@ fn draw_about_view(f: &mut Frame, area: Rect, app: &App) {
     let paragraph = Paragraph::new(about_text)
         .block(Block::default().borders(Borders::ALL).title(" About [F7] "))
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll_offset as u16, 0));
+        .scroll((app.scroll_offset.min(u16::MAX as usize) as u16, 0));
     f.render_widget(paragraph, area);
 }
 
@@ -1161,7 +1166,8 @@ fn draw_multi_model_view(f: &mut Frame, area: Rect, app: &App) {
         let content: Vec<Line> = responses.iter()
             .flat_map(|line| {
                 let max_width = (chunks[i].width.saturating_sub(2)) as usize;
-                if line.len() > max_width && max_width > 0 {
+                let char_count = line.chars().count();
+                if char_count > max_width && max_width > 0 {
                     line.chars()
                         .collect::<Vec<_>>()
                         .chunks(max_width)
@@ -1219,11 +1225,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
     let input = Paragraph::new(app.input.as_str())
         .block(Block::default().borders(Borders::ALL).title("Input"))
-        .scroll((0, scroll_offset as u16));
+        .scroll((0, scroll_offset.min(u16::MAX as usize) as u16));
     f.render_widget(input, area);
 
     f.set_cursor_position((
-        area.x + visible_cursor_pos as u16 + 1,
+        area.x.saturating_add(visible_cursor_pos.min(u16::MAX as usize) as u16).saturating_add(1),
         area.y + 1,
     ));
 }

@@ -1597,7 +1597,7 @@ fn apply_env_overrides(config: &mut LocalConfig, overrides: &[String]) {
         config.sandbox.env_whitelist.insert(key.clone());
     }
 
-    let mut apply_to_tool = |tool: &mut Option<config::ToolConfig>| {
+    let apply_to_tool = |tool: &mut Option<config::ToolConfig>| {
         if let Some(ref mut tool_config) = tool {
             tool_config.env.extend(entries.clone());
         }

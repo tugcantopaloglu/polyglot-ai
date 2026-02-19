@@ -123,5 +123,7 @@ impl Default for UiSettings {
 
 pub fn generate_example_config() -> String {
     let config = ClientConfig::default();
-    toml::to_string_pretty(&config).expect("Failed to serialize default config")
+    toml::to_string_pretty(&config).unwrap_or_else(|e| {
+        format!("# Failed to generate example config: {}\n# Please create config manually", e)
+    })
 }
