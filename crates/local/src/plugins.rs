@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+// Plugin system for Polyglot-AI Local
 
 use std::collections::HashMap;
 use std::path::PathBuf;

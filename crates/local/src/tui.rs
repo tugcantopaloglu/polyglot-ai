@@ -86,14 +86,69 @@ pub struct App {
     pub scroll_offset: usize,
     pub current_response: String,
     pub multi_model: MultiModelState,
+    pub plugins: Vec<crate::plugins::PluginConfig>,
+    pub plugin_usage: Vec<crate::plugins::PluginUsage>,
+    pub show_timestamps: bool,
+    pub theme: Theme,
 }
 
 #[derive(Clone)]
 pub struct OutputLine {
-    #[allow(dead_code)]
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub line_type: OutputType,
     pub content: String,
+}
+
+/// Theme configuration for TUI colors
+#[derive(Clone)]
+pub struct Theme {
+    pub user_fg: Color,
+    pub assistant_fg: Color,
+    pub system_fg: Color,
+    pub error_fg: Color,
+    pub border_fg: Color,
+    pub header_fg: Color,
+    pub status_fg: Color,
+}
+
+impl Theme {
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "dark" => Self {
+                user_fg: Color::LightGreen,
+                assistant_fg: Color::LightCyan,
+                system_fg: Color::Yellow,
+                error_fg: Color::LightRed,
+                border_fg: Color::Gray,
+                header_fg: Color::Cyan,
+                status_fg: Color::Gray,
+            },
+            "light" => Self {
+                user_fg: Color::DarkGray,
+                assistant_fg: Color::Black,
+                system_fg: Color::Blue,
+                error_fg: Color::Red,
+                border_fg: Color::DarkGray,
+                header_fg: Color::Blue,
+                status_fg: Color::DarkGray,
+            },
+            _ => Self::default(),
+        }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            user_fg: Color::Green,
+            assistant_fg: Color::White,
+            system_fg: Color::Yellow,
+            error_fg: Color::Red,
+            border_fg: Color::Reset,
+            header_fg: Color::Cyan,
+            status_fg: Color::Gray,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -113,6 +168,7 @@ pub enum View {
     Help,
     MultiSelect,
     About,
+    Plugin,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +188,8 @@ pub enum AppAction {
     DisableMultiModel,
     ToggleMultiTool(Tool),
     PerformUpdate,
+    RunPlugin(String, String),
+    SaveConfig,
 }
 
 impl Default for App {
@@ -152,6 +210,10 @@ impl Default for App {
             scroll_offset: 0,
             current_response: String::new(),
             multi_model: MultiModelState::new(),
+            plugins: Vec::new(),
+            plugin_usage: Vec::new(),
+            show_timestamps: false,
+            theme: Theme::default(),
         }
     }
 }
@@ -195,6 +257,7 @@ impl App {
             (KeyCode::F(5), _) => { self.view = View::Help; None }
             (KeyCode::F(6), _) => { self.view = View::MultiSelect; Some(AppAction::RequestTools) }
             (KeyCode::F(7), _) => { self.view = View::About; None }
+            (KeyCode::F(8), _) => { self.view = View::Plugin; None }
 
             (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
                 Some(AppAction::NewChat)
@@ -506,6 +569,22 @@ impl App {
                 self.add_output(OutputType::System, "Checking for updates...".to_string());
                 AppAction::PerformUpdate
             }
+            Some("plugin") | Some("p") => {
+                if parts.len() >= 3 {
+                    let plugin_name = parts[1].to_string();
+                    let prompt = parts[2..].join(" ");
+                    AppAction::RunPlugin(plugin_name, prompt)
+                } else if parts.len() == 1 {
+                    self.view = View::Plugin;
+                    AppAction::None
+                } else {
+                    self.add_output(OutputType::Error, "Usage: /plugin <name> <prompt> or /plugin (to list)".to_string());
+                    AppAction::None
+                }
+            }
+            Some("save") => {
+                AppAction::SaveConfig
+            }
             _ => {
                 self.add_output(OutputType::Error, format!("Unknown command: {}", input));
                 AppAction::None
@@ -541,6 +620,7 @@ pub fn draw_ui(f: &mut Frame, app: &App) {
         View::Help => draw_help_view(f, chunks[1], app),
         View::MultiSelect => draw_multi_select_view(f, chunks[1], app),
         View::About => draw_about_view(f, chunks[1], app),
+        View::Plugin => draw_plugin_view(f, chunks[1], app),
     }
 
     if app.view == View::Chat || app.view == View::MultiSelect {
@@ -562,6 +642,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         if app.view == View::Help { "[F5 Help]" } else { " F5 Help " },
         if app.view == View::MultiSelect { "[F6 Multi]" } else { " F6 Multi " },
         if app.view == View::About { "[F7 About]" } else { " F7 About " },
+        if app.view == View::Plugin { "[F8 Plugin]" } else { " F8 Plugin " },
     ];
 
     let multi_indicator = if app.multi_model.enabled {
@@ -571,10 +652,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     };
 
     let header = Line::from(vec![
-        Span::styled("Polyglot-AI Local ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("Polyglot-AI Local ", Style::default().fg(app.theme.header_fg).add_modifier(Modifier::BOLD)),
         Span::raw("| "),
         Span::raw(tabs.join(" ")),
-        Span::styled(multi_indicator, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(multi_indicator, Style::default().fg(app.theme.system_fg).add_modifier(Modifier::BOLD)),
     ]);
 
     let paragraph = Paragraph::new(header).style(Style::default().bg(Color::DarkGray));
@@ -596,10 +677,10 @@ fn draw_chat_view(f: &mut Frame, area: Rect, app: &App) {
         .take(visible_height)
         .map(|line| {
             let style = match line.line_type {
-                OutputType::User => Style::default().fg(Color::Green),
-                OutputType::Assistant => Style::default().fg(Color::White),
-                OutputType::System => Style::default().fg(Color::Yellow),
-                OutputType::Error => Style::default().fg(Color::Red),
+                OutputType::User => Style::default().fg(app.theme.user_fg),
+                OutputType::Assistant => Style::default().fg(app.theme.assistant_fg),
+                OutputType::System => Style::default().fg(app.theme.system_fg),
+                OutputType::Error => Style::default().fg(app.theme.error_fg),
             };
 
             let prefix = match line.line_type {
@@ -609,10 +690,15 @@ fn draw_chat_view(f: &mut Frame, area: Rect, app: &App) {
                 OutputType::Error => "! ",
             };
 
-            ListItem::new(Line::from(vec![
-                Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-                Span::styled(&line.content, style),
-            ]))
+            let mut spans = Vec::new();
+            if app.show_timestamps {
+                let ts = line.timestamp.format("[%H:%M] ").to_string();
+                spans.push(Span::styled(ts, Style::default().fg(app.theme.status_fg)));
+            }
+            spans.push(Span::styled(prefix, style.add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(&line.content, style));
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -859,13 +945,15 @@ fn draw_help_view(f: &mut Frame, area: Rect, app: &App) {
         Line::from("  /multi <t1> <t2> ... - Enable multi-model with specific tools"),
         Line::from("  /single     - Return to single-tool mode"),
         Line::from("  /update     - Check for updates"),
+        Line::from("  /plugin     - List plugins (or /plugin <name> <prompt> to run)"),
+        Line::from("  /save       - Save current config"),
         Line::from("  /clear      - Clear chat output"),
         Line::from("  /about      - About Polyglot-AI"),
         Line::from("  /help       - Show this help"),
         Line::from("  /quit       - Exit"),
         Line::from(""),
         Line::from(Span::styled("Keyboard Shortcuts:", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from("  F1-F7         - Switch views (Chat, Tools, Usage, History, Help, Multi, About)"),
+        Line::from("  F1-F8         - Switch views (Chat, Tools, Usage, History, Help, Multi, About, Plugin)"),
         Line::from("  Ctrl+M        - Toggle multi-model mode"),
         Line::from("  Ctrl+N        - New chat with context transfer"),
         Line::from("  Ctrl+C/Q      - Quit"),
@@ -991,6 +1079,66 @@ fn draw_about_view(f: &mut Frame, area: Rect, app: &App) {
         .block(Block::default().borders(Borders::ALL).title(" About [F7] "))
         .wrap(Wrap { trim: false })
         .scroll((app.scroll_offset.min(u16::MAX as usize) as u16, 0));
+    f.render_widget(paragraph, area);
+}
+
+fn draw_plugin_view(f: &mut Frame, area: Rect, app: &App) {
+    let mut text = vec![
+        Line::from(Span::styled("Plugins", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+
+    if app.plugins.is_empty() {
+        text.push(Line::from(Span::styled(
+            "No plugins configured. Add plugins to your config file.",
+            Style::default().fg(Color::Gray),
+        )));
+        text.push(Line::from(""));
+        text.push(Line::from("Usage: /plugin <name> <prompt>"));
+    } else {
+        text.push(Line::from(vec![
+            Span::styled(
+                format!("{:<20} {:<10} {:<10} {:<8}",
+                    "Name", "Type", "Status", "Requests"),
+                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+            ),
+        ]));
+        text.push(Line::from(Span::styled(
+            "─".repeat(52),
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        for plugin in &app.plugins {
+            let type_str = match plugin.plugin_type {
+                crate::plugins::PluginType::Cli => "CLI",
+                crate::plugins::PluginType::Http => "HTTP",
+                crate::plugins::PluginType::Script => "Script",
+            };
+            let status = if plugin.enabled { "Enabled" } else { "Disabled" };
+            let status_color = if plugin.enabled { Color::Green } else { Color::Red };
+
+            let usage = app.plugin_usage.iter()
+                .find(|u| u.name == plugin.name);
+            let requests = usage.map(|u| u.requests).unwrap_or(0);
+
+            text.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<20} ", plugin.display_name.as_deref().unwrap_or(&plugin.name)),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(format!("{:<10} ", type_str), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{:<10} ", status), Style::default().fg(status_color)),
+                Span::styled(format!("{}", requests), Style::default().fg(Color::Gray)),
+            ]));
+        }
+
+        text.push(Line::from(""));
+        text.push(Line::from("Usage: /plugin <name> <prompt>"));
+    }
+
+    let paragraph = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title(" Plugins [F8] "))
+        .wrap(Wrap { trim: false });
     f.render_widget(paragraph, area);
 }
 
@@ -1241,14 +1389,14 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
         let tool_names: Vec<_> = app.multi_model.selected_tools.iter()
             .map(|t| t.as_str())
             .collect();
-        spans.push(Span::styled("Multi-Model: ", Style::default().fg(Color::Yellow)));
-        spans.push(Span::styled(tool_names.join(", "), Style::default().fg(Color::Green)));
+        spans.push(Span::styled("Multi-Model: ", Style::default().fg(app.theme.system_fg)));
+        spans.push(Span::styled(tool_names.join(", "), Style::default().fg(app.theme.user_fg)));
     } else {
         let tool_name = app.current_tool
             .map(|t| t.display_name())
             .unwrap_or("None");
-        spans.push(Span::styled("Tool: ", Style::default().fg(Color::Gray)));
-        spans.push(Span::styled(tool_name, Style::default().fg(Color::Cyan)));
+        spans.push(Span::styled("Tool: ", Style::default().fg(app.theme.status_fg)));
+        spans.push(Span::styled(tool_name, Style::default().fg(app.theme.header_fg)));
     }
 
     spans.push(Span::raw(" | "));

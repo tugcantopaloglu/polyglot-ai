@@ -199,7 +199,7 @@ async fn run_interactive(config: &ClientConfig) -> Result<()> {
 
                 // Check if client version is below minimum required
                 if let Some(min_version) = min_client_version {
-                    if version_compare(client_version, &min_version) == std::cmp::Ordering::Less {
+                    if polyglot_common::version_compare(client_version, &min_version) == std::cmp::Ordering::Less {
                         app.add_output(OutputType::Error,
                             format!("⚠️  Your client (v{}) is outdated. Minimum required: v{}", client_version, min_version));
                         if let Some(url) = &update_url {

@@ -17,6 +17,7 @@ struct ToolManagerInner {
     switch_delay: u8,
     default_tool: Tool,
     current_tool: RwLock<Tool>,
+    tool_priorities: HashMap<Tool, u8>,
 }
 
 #[derive(Clone)]
@@ -28,6 +29,7 @@ impl ToolManager {
     pub fn new(config: &ToolsSettings) -> Self {
         let mut adapters: HashMap<Tool, Arc<dyn ToolAdapter>> = HashMap::new();
         let mut usage: HashMap<Tool, ToolUsage> = HashMap::new();
+        let mut tool_priorities: HashMap<Tool, u8> = HashMap::new();
 
         if let Some(ref claude_config) = config.claude {
             if claude_config.enabled {
@@ -40,6 +42,7 @@ impl ToolManager {
                     )),
                 );
                 usage.insert(Tool::Claude, ToolUsage::new(Tool::Claude));
+                tool_priorities.insert(Tool::Claude, claude_config.priority);
             }
         }
 
@@ -54,6 +57,7 @@ impl ToolManager {
                     )),
                 );
                 usage.insert(Tool::Gemini, ToolUsage::new(Tool::Gemini));
+                tool_priorities.insert(Tool::Gemini, gemini_config.priority);
             }
         }
 
@@ -68,6 +72,7 @@ impl ToolManager {
                     )),
                 );
                 usage.insert(Tool::Codex, ToolUsage::new(Tool::Codex));
+                tool_priorities.insert(Tool::Codex, codex_config.priority);
             }
         }
 
@@ -82,6 +87,7 @@ impl ToolManager {
                     )),
                 );
                 usage.insert(Tool::Copilot, ToolUsage::new(Tool::Copilot));
+                tool_priorities.insert(Tool::Copilot, copilot_config.priority);
             }
         }
 
@@ -96,6 +102,7 @@ impl ToolManager {
                     )),
                 );
                 usage.insert(Tool::Cursor, ToolUsage::new(Tool::Cursor));
+                tool_priorities.insert(Tool::Cursor, cursor_config.priority);
             }
         }
 
@@ -114,6 +121,7 @@ impl ToolManager {
                     )),
                 );
                 usage.insert(Tool::Ollama, ToolUsage::new(Tool::Ollama));
+                tool_priorities.insert(Tool::Ollama, ollama_config.priority);
             }
         }
 
@@ -125,6 +133,7 @@ impl ToolManager {
                 switch_delay: config.switch_delay,
                 default_tool: config.default_tool,
                 current_tool: RwLock::new(config.default_tool),
+                tool_priorities,
             }),
         }
     }
@@ -197,9 +206,28 @@ impl ToolManager {
                             stats.is_available = false;
                         }
                     }
+                    ToolOutput::Stderr(line) => {
+                        // Detect rate limiting from stderr
+                        if super::is_rate_limit_message(line) {
+                            rate_limited = true;
+                            let mut usage = inner_clone.usage.write();
+                            if let Some(stats) = usage.get_mut(&tool_clone) {
+                                stats.rate_limit_hits += 1;
+                                stats.is_available = false;
+                            }
+                        }
+                    }
+                    ToolOutput::Stdout(line) => {
+                        // Try to parse token counts from stdout
+                        if let Some(count) = super::parse_token_count(line) {
+                            tokens = Some(count);
+                        }
+                    }
                     ToolOutput::Done { tokens: t } => {
-                        tokens = *t;
-                        if let Some(count) = t {
+                        if t.is_some() {
+                            tokens = *t;
+                        }
+                        if let Some(count) = tokens {
                             let mut usage = inner_clone.usage.write();
                             if let Some(stats) = usage.get_mut(&tool_clone) {
                                 stats.tokens_used += count;
@@ -212,7 +240,6 @@ impl ToolManager {
                             stats.errors += 1;
                         }
                     }
-                    _ => {}
                 }
 
                 if output_tx_clone.send(output).await.is_err() {
@@ -238,7 +265,8 @@ impl ToolManager {
         let available = self.available_tools().await;
 
         match self.inner.rotation_strategy {
-            RotationStrategy::OnLimit | RotationStrategy::Priority => {
+            RotationStrategy::OnLimit => {
+                // OnLimit: use hardcoded priority order
                 let priorities = [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::Copilot, Tool::Perplexity, Tool::Cursor];
                 for tool in priorities {
                     if tool != current && available.contains(&tool) {
@@ -247,6 +275,23 @@ impl ToolManager {
                             if stats.is_available {
                                 return Some(tool);
                             }
+                        }
+                    }
+                }
+            }
+            RotationStrategy::Priority => {
+                // Priority: sort by configured priority (lower number = higher priority)
+                let mut candidates: Vec<Tool> = available.iter()
+                    .filter(|t| **t != current)
+                    .copied()
+                    .collect();
+                candidates.sort_by_key(|t| self.inner.tool_priorities.get(t).copied().unwrap_or(100));
+
+                let usage = self.inner.usage.read();
+                for tool in candidates {
+                    if let Some(stats) = usage.get(&tool) {
+                        if stats.is_available {
+                            return Some(tool);
                         }
                     }
                 }

@@ -34,9 +34,7 @@ struct LocalToolManagerInner {
     configs: HashMap<Tool, ToolConfig>,
     usage: RwLock<HashMap<Tool, ToolUsage>>,
     rotation_strategy: RotationStrategy,
-    #[allow(dead_code)]
     switch_delay: u8,
-    #[allow(dead_code)]
     default_tool: Tool,
     environment: EnvironmentManager,
     sandbox: SandboxSettings,
@@ -391,7 +389,6 @@ impl LocalToolManager {
         self.inner.usage.read().values().cloned().collect()
     }
 
-    #[allow(dead_code)]
     pub fn default_tool(&self) -> Tool {
         self.inner.default_tool
     }
@@ -447,7 +444,6 @@ impl LocalToolManager {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn configured_tools(&self) -> Vec<Tool> {
         self.inner.configs.keys().copied().collect()
     }
@@ -457,7 +453,7 @@ fn get_next_tool(inner: &LocalToolManagerInner, current: Tool) -> Option<Tool> {
     let usage = inner.usage.read();
 
     match inner.rotation_strategy {
-        RotationStrategy::OnLimit | RotationStrategy::Priority => {
+        RotationStrategy::OnLimit => {
             let priorities = [Tool::Claude, Tool::Gemini, Tool::Codex, Tool::Copilot, Tool::Perplexity, Tool::Cursor, Tool::Ollama];
             for tool in priorities {
                 if tool != current {
@@ -465,6 +461,22 @@ fn get_next_tool(inner: &LocalToolManagerInner, current: Tool) -> Option<Tool> {
                         if stats.is_available && inner.configs.contains_key(&tool) {
                             return Some(tool);
                         }
+                    }
+                }
+            }
+        }
+        RotationStrategy::Priority => {
+            // Sort configured tools by their priority field (lower = higher priority)
+            let mut candidates: Vec<(Tool, u8)> = inner.configs.iter()
+                .filter(|(t, _)| **t != current)
+                .map(|(t, c)| (*t, c.priority))
+                .collect();
+            candidates.sort_by_key(|(_, p)| *p);
+
+            for (tool, _) in candidates {
+                if let Some(stats) = usage.get(&tool) {
+                    if stats.is_available {
+                        return Some(tool);
                     }
                 }
             }

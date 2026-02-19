@@ -1867,16 +1867,19 @@ dependencies = [
 name = "polyglot-common"
 version = "0.1.4"
 dependencies = [
+ "anyhow",
  "base64",
  "chrono",
  "directories",
  "parking_lot",
+ "reqwest",
  "ring",
  "rmp-serde",
  "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "tracing",
  "uuid",
 ]
 

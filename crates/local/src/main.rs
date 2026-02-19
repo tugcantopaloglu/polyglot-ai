@@ -13,7 +13,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 use polyglot_common::Tool;
@@ -21,6 +20,7 @@ use config::LocalConfig;
 use tools::{LocalToolManager, ToolOutput, TaggedOutput};
 use tui::{App, AppAction, OutputType};
 use history::HistoryManager;
+use plugins::PluginManager;
 
 #[derive(Parser)]
 #[command(name = "polyglot-local")]
@@ -369,7 +369,7 @@ async fn show_splash_screen<B: ratatui::backend::Backend>(terminal: &mut ratatui
     Ok(())
 }
 
-async fn run_tui(tool_manager: LocalToolManager, _config: &LocalConfig, mut history_manager: HistoryManager) -> Result<()> {
+async fn run_tui(tool_manager: LocalToolManager, config: &LocalConfig, mut history_manager: HistoryManager) -> Result<()> {
     use std::time::Duration;
     use crossterm::{
         event::{self, DisableMouseCapture, EnableMouseCapture, Event},
@@ -407,6 +407,17 @@ async fn run_tui(tool_manager: LocalToolManager, _config: &LocalConfig, mut hist
     show_splash_screen(&mut terminal).await?;
 
     let mut app = App::new();
+    app.plugins = config.plugins.clone();
+    app.show_timestamps = config.ui.show_timestamps;
+    app.theme = tui::Theme::from_name(&config.ui.theme);
+
+    let plugin_manager = std::sync::Arc::new(tokio::sync::Mutex::new(
+        PluginManager::new(config.plugins.clone())
+    ));
+
+    let config_path = config::LocalConfig::default_path();
+    let config_clone = config.clone();
+
     app.add_output(OutputType::System, "Welcome to Polyglot-AI Local!".to_string());
     app.add_output(OutputType::System, "Type your message and press Enter to send.".to_string());
     app.add_output(OutputType::System, "Use /help for commands, /update to check for updates, Ctrl+Q to quit.".to_string());
@@ -596,6 +607,22 @@ async fn run_tui(tool_manager: LocalToolManager, _config: &LocalConfig, mut hist
                                                 }
                                             }
                                         });
+                                    }
+                                    AppAction::RunPlugin(plugin_name, prompt) => {
+                                        let pm = plugin_manager.clone();
+                                        let tx = response_tx.clone();
+                                        tokio::spawn(async move {
+                                            let mut manager = pm.lock().await;
+                                            if let Err(e) = manager.execute(&plugin_name, &prompt, tx.clone()).await {
+                                                let _ = tx.send(ToolOutput::Error(format!("Plugin error: {}", e))).await;
+                                            }
+                                        });
+                                    }
+                                    AppAction::SaveConfig => {
+                                        match config_clone.save(&config_path) {
+                                            Ok(_) => app.add_output(OutputType::System, format!("Config saved to {:?}", config_path)),
+                                            Err(e) => app.add_output(OutputType::Error, format!("Failed to save config: {}", e)),
+                                        }
                                     }
                                     AppAction::PerformUpdate => {
                                         match polyglot_common::check_for_updates_github("polyglot-local").await {

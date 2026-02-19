@@ -86,6 +86,9 @@ pub struct ToolConfig {
 
     #[serde(default)]
     pub use_isolated: bool,
+
+    #[serde(default = "default_priority")]
+    pub priority: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +230,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_priority() -> u8 {
+    50
+}
+
 fn default_theme() -> String {
     "default".to_string()
 }
@@ -265,6 +272,7 @@ impl Default for ToolsConfig {
                 args: vec![],
                 env: vec![],
                 use_isolated: true,
+                priority: 1,
             }),
             gemini: Some(ToolConfig {
                 enabled: true,
@@ -272,6 +280,7 @@ impl Default for ToolsConfig {
                 args: vec![],
                 env: vec![],
                 use_isolated: true,
+                priority: 2,
             }),
             codex: Some(ToolConfig {
                 enabled: true,
@@ -279,6 +288,7 @@ impl Default for ToolsConfig {
                 args: vec![],
                 env: vec![],
                 use_isolated: true,
+                priority: 3,
             }),
             copilot: Some(ToolConfig {
                 enabled: true,
@@ -286,6 +296,7 @@ impl Default for ToolsConfig {
                 args: vec!["copilot".to_string()],
                 env: vec![],
                 use_isolated: true,
+                priority: 4,
             }),
             perplexity: Some(ToolConfig {
                 enabled: true,
@@ -293,6 +304,7 @@ impl Default for ToolsConfig {
                 args: vec![],
                 env: vec![],
                 use_isolated: true,
+                priority: 5,
             }),
             cursor: Some(ToolConfig {
                 enabled: true,
@@ -300,6 +312,7 @@ impl Default for ToolsConfig {
                 args: vec![],
                 env: vec![],
                 use_isolated: true,
+                priority: 6,
             }),
             ollama: Some(ToolConfig {
                 enabled: true,
@@ -307,6 +320,7 @@ impl Default for ToolsConfig {
                 args: vec![],
                 env: vec![],
                 use_isolated: true,
+                priority: 7,
             }),
         }
     }
@@ -336,7 +350,6 @@ impl LocalConfig {
         Ok(config)
     }
 
-    #[allow(dead_code)]
     pub fn save(&self, path: &PathBuf) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
