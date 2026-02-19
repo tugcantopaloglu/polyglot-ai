@@ -61,6 +61,8 @@ pub struct ServerSettings {
     pub max_connections: u32,
     pub idle_timeout: u64,
     pub verbose: bool,
+    #[serde(default)]
+    pub metrics_port: Option<u16>,
 }
 
 impl Default for ServerSettings {
@@ -70,6 +72,7 @@ impl Default for ServerSettings {
             max_connections: 100,
             idle_timeout: 300,
             verbose: false,
+            metrics_port: None,
         }
     }
 }

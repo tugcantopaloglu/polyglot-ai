@@ -1214,19 +1214,38 @@ where
 
     let mut stdout_done = false;
     let mut stderr_done = false;
+    let mut stream_buffer = polyglot_common::StreamBuffer::new(
+        polyglot_common::StreamConfig::default()
+    );
 
     while !(stdout_done && stderr_done) {
         tokio::select! {
             line = stdout_lines.next_line(), if !stdout_done => {
                 match line? {
                     Some(text) => {
+                        // Send ToolResponse for backward compatibility
                         let msg = ServerMessage::ToolResponse {
                             tool,
-                            content: text,
+                            content: text.clone(),
                             done: false,
                             tokens: None,
                         };
                         send_ws_message(ws_write, codec, &msg).await?;
+
+                        // Also send via streaming
+                        stream_buffer.push(&text);
+                        stream_buffer.push("\n");
+                        if stream_buffer.should_flush() {
+                            for chunk in stream_buffer.flush() {
+                                let chunk_msg = ServerMessage::StreamChunk {
+                                    tool,
+                                    content: chunk.content,
+                                    sequence: chunk.sequence,
+                                    is_final: false,
+                                };
+                                send_ws_message(ws_write, codec, &chunk_msg).await?;
+                            }
+                        }
                     }
                     None => stdout_done = true,
                 }
@@ -1254,6 +1273,17 @@ where
             message: format!("polyglot-local exited with {}", status),
         };
         send_ws_message(ws_write, codec, &msg).await?;
+    }
+
+    // Finalize stream
+    for chunk in stream_buffer.finalize() {
+        let chunk_msg = ServerMessage::StreamChunk {
+            tool,
+            content: chunk.content,
+            sequence: chunk.sequence,
+            is_final: chunk.is_final,
+        };
+        send_ws_message(ws_write, codec, &chunk_msg).await?;
     }
 
     let done = ServerMessage::ToolResponse {
