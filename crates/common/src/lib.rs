@@ -48,6 +48,7 @@ pub use updater::{
     version_compare, get_platform_asset_name, get_backup_dir,
     create_backup, restore_backup, cleanup_old_backups,
     get_current_exe, verify_binary, format_bytes, print_status,
+    check_for_updates_github, perform_update, check_updates_on_startup,
 };
 
 pub use storage::{

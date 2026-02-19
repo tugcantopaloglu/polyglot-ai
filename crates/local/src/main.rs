@@ -413,7 +413,7 @@ async fn run_tui(tool_manager: LocalToolManager, _config: &LocalConfig, mut hist
 
     // Check for updates in background
     tokio::spawn(async {
-        if let Some(msg) = check_updates_on_startup().await {
+        if let Some(msg) = polyglot_common::check_updates_on_startup("polyglot-local").await {
             // We can't directly add to app here, so we'll print to stderr
             // The user will see it on next interaction
             eprintln!("\n{}", msg);
@@ -598,7 +598,7 @@ async fn run_tui(tool_manager: LocalToolManager, _config: &LocalConfig, mut hist
                                         });
                                     }
                                     AppAction::PerformUpdate => {
-                                        match check_for_updates_github("polyglot-local").await {
+                                        match polyglot_common::check_for_updates_github("polyglot-local").await {
                                             Ok(info) => {
                                                 if info.update_available {
                                                     app.add_output(OutputType::System,
@@ -1233,7 +1233,7 @@ async fn run_update(check_only: bool, force: bool) -> Result<()> {
         progress: None,
     });
 
-    let update_info = check_for_updates_github("polyglot-local").await?;
+    let update_info = polyglot_common::check_for_updates_github("polyglot-local").await?;
 
     if !update_info.update_available && !force {
         println!();
@@ -1243,9 +1243,9 @@ async fn run_update(check_only: bool, force: bool) -> Result<()> {
 
     println!();
     if update_info.update_available {
-        println!("\x1b[33m🆕 New version available: v{}\x1b[0m", update_info.latest_version);
+        println!("\x1b[33m New version available: v{}\x1b[0m", update_info.latest_version);
     } else {
-        println!("\x1b[33m⚠ Force update requested for v{}\x1b[0m", update_info.latest_version);
+        println!("\x1b[33m Force update requested for v{}\x1b[0m", update_info.latest_version);
     }
 
     if let Some(ref notes) = update_info.release_notes {
@@ -1280,173 +1280,7 @@ async fn run_update(check_only: bool, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Perform the update
-    perform_update(&update_info).await
-}
-
-/// Check for updates from GitHub releases
-async fn check_for_updates_github(binary_name: &str) -> Result<polyglot_common::updater::UpdateInfo> {
-    use polyglot_common::updater::*;
-
-    let client = reqwest::Client::builder()
-        .user_agent("polyglot-ai-updater")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let url = "https://api.github.com/repos/tugcantopaloglu/polyglot-ai/releases/latest";
-
-    let response = client.get(url).send().await?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("Failed to check for updates: HTTP {}", response.status());
-    }
-
-    let release: GitHubRelease = response.json().await?;
-
-    let current_version = env!("CARGO_PKG_VERSION");
-    let latest_version = release.tag_name.trim_start_matches('v').to_string();
-
-    let update_available = version_compare(&latest_version, current_version) == std::cmp::Ordering::Greater;
-
-    let asset_name = get_platform_asset_name(binary_name);
-    let (download_url, found_asset) = release.assets.iter()
-        .find(|a| a.name == asset_name || a.name.contains(&asset_name.replace(".exe", "")))
-        .map(|a| (Some(a.browser_download_url.clone()), Some(a.name.clone())))
-        .unwrap_or((None, None));
-
-    Ok(UpdateInfo {
-        current_version: current_version.to_string(),
-        latest_version,
-        update_available,
-        release_notes: release.body,
-        download_url,
-        asset_name: found_asset,
-    })
-}
-
-/// Perform the actual update with backup and rollback support
-async fn perform_update(update_info: &polyglot_common::updater::UpdateInfo) -> Result<()> {
-    use polyglot_common::updater::*;
-
-    let download_url = update_info.download_url.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No download URL available for your platform"))?;
-
-    let current_exe = get_current_exe()?;
-    let current_version = env!("CARGO_PKG_VERSION");
-
-    // Phase 1: Create backup
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Backing,
-        message: "Creating backup...".to_string(),
-        progress: None,
-    });
-
-    let backup_info = create_backup(&current_exe, current_version)?;
-    println!("  Backup saved to: {:?}", backup_info.backup_path);
-
-    // Phase 2: Download new version
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Downloading,
-        message: format!("Downloading v{}...", update_info.latest_version),
-        progress: Some(0),
-    });
-
-    let client = reqwest::Client::builder()
-        .user_agent("polyglot-ai-updater")
-        .build()?;
-
-    let response = client.get(download_url).send().await?;
-
-    if !response.status().is_success() {
-        // Rollback not needed yet, just fail
-        anyhow::bail!("Download failed: HTTP {}", response.status());
-    }
-
-    let _total_size = response.content_length().unwrap_or(0);
-    let new_binary = response.bytes().await?;
-
-    println!();
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Downloading,
-        message: format!("Downloaded {}", format_bytes(new_binary.len() as u64)),
-        progress: Some(100),
-    });
-
-    // Phase 3: Install new version
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Installing,
-        message: "Installing update...".to_string(),
-        progress: None,
-    });
-
-    let temp_path = current_exe.with_extension("new");
-
-    if let Err(e) = std::fs::write(&temp_path, &new_binary) {
-        error!("Failed to write new binary: {}", e);
-        println!();
-        print_status(&UpdateStatus {
-            phase: UpdatePhase::Failed,
-            message: format!("Failed to write new binary: {}", e),
-            progress: None,
-        });
-        return Err(e.into());
-    }
-
-    // Phase 4: Verify the new binary
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Verifying,
-        message: "Verifying new binary...".to_string(),
-        progress: None,
-    });
-
-    if !verify_binary(&temp_path) {
-        let _ = std::fs::remove_file(&temp_path);
-        println!();
-        print_status(&UpdateStatus {
-            phase: UpdatePhase::Failed,
-            message: "Downloaded binary is invalid!".to_string(),
-            progress: None,
-        });
-        anyhow::bail!("Downloaded binary failed verification");
-    }
-
-    // Phase 5: Replace the current binary
-    #[cfg(windows)]
-    {
-        // On Windows, rename the running executable
-        let old_path = current_exe.with_extension("exe.old");
-        std::fs::rename(&current_exe, &old_path)?;
-        std::fs::rename(&temp_path, &current_exe)?;
-        // Schedule cleanup of old file
-        let _ = std::fs::remove_file(&old_path);
-    }
-
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(&temp_path, &current_exe)?;
-        // Set executable permissions
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&current_exe)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&current_exe, perms)?;
-        }
-    }
-
-    // Phase 6: Cleanup old backups
-    let _ = cleanup_old_backups(3);
-
-    println!();
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Complete,
-        message: format!("Successfully updated to v{}!", update_info.latest_version),
-        progress: None,
-    });
-
-    println!();
-    println!("\x1b[32m✓ Update complete! Please restart the application.\x1b[0m");
-
+    polyglot_common::perform_update(&update_info).await?;
     Ok(())
 }
 
@@ -1523,20 +1357,6 @@ async fn perform_update_tui(update_info: &polyglot_common::updater::UpdateInfo, 
     app.add_output(tui::OutputType::System, format!("Successfully updated to v{}!", update_info.latest_version));
 
     Ok(true)
-}
-
-/// Check for updates on startup (non-blocking notification)
-async fn check_updates_on_startup() -> Option<String> {
-    match check_for_updates_github("polyglot-local").await {
-        Ok(info) if info.update_available => {
-            Some(format!(
-                "🆕 Update available: v{} → v{} (run 'polyglot-local update' to install)",
-                info.current_version,
-                info.latest_version
-            ))
-        }
-        _ => None,
-    }
 }
 
 async fn run_drive_sync(config: &LocalConfig, direction: &str) -> Result<()> {
