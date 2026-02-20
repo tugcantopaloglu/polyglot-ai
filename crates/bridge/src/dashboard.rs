@@ -88,18 +88,25 @@ async fn handle_http_request(
 
     // Check auth if required
     if config.require_auth {
-        if let Some(expected_token) = &config.auth_token {
-            let auth_header = request.lines()
-                .find(|l| l.to_lowercase().starts_with("authorization:"))
-                .and_then(|l| l.split_once(':'))
-                .map(|(_, v)| v.trim());
+        match &config.auth_token {
+            Some(expected_token) => {
+                let auth_header = request.lines()
+                    .find(|l| l.to_lowercase().starts_with("authorization:"))
+                    .and_then(|l| l.split_once(':'))
+                    .map(|(_, v)| v.trim());
 
-            let provided = auth_header
-                .and_then(|h| h.strip_prefix("Bearer "))
-                .unwrap_or("");
+                let provided = auth_header
+                    .and_then(|h| h.strip_prefix("Bearer "))
+                    .unwrap_or("");
 
-            if provided != expected_token {
-                send_response(&mut stream, 401, "text/plain", "Unauthorized").await?;
+                if provided != expected_token {
+                    send_response(&mut stream, 401, "text/plain", "Unauthorized").await?;
+                    return Ok(());
+                }
+            }
+            None => {
+                // Auth required but no token configured - deny all requests
+                send_response(&mut stream, 401, "text/plain", "Unauthorized: no auth token configured").await?;
                 return Ok(());
             }
         }

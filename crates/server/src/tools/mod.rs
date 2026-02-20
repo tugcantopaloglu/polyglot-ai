@@ -1,6 +1,6 @@
 //! AI tool adapters and management
 
-#![allow(dead_code)]
+// AI tool adapters and management
 
 mod manager;
 mod claude;

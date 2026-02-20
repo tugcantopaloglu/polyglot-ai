@@ -1,7 +1,5 @@
 //! Terminal User Interface for Polyglot-AI client
 
-#![allow(dead_code)]
-
 mod views;
 
 use std::io::{self, Stdout};
@@ -37,6 +35,8 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
     pub scroll_offset: usize,
+    pub show_timestamps: bool,
+    pub theme: Theme,
 }
 
 #[derive(Clone)]
@@ -44,6 +44,58 @@ pub struct OutputLine {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub line_type: OutputType,
     pub content: String,
+}
+
+/// Theme configuration for TUI colors
+#[derive(Clone)]
+pub struct Theme {
+    pub user_fg: Color,
+    pub assistant_fg: Color,
+    pub system_fg: Color,
+    pub error_fg: Color,
+    pub border_fg: Color,
+    pub header_fg: Color,
+    pub status_fg: Color,
+}
+
+impl Theme {
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "dark" => Self {
+                user_fg: Color::LightGreen,
+                assistant_fg: Color::LightCyan,
+                system_fg: Color::Yellow,
+                error_fg: Color::LightRed,
+                border_fg: Color::Gray,
+                header_fg: Color::Cyan,
+                status_fg: Color::Gray,
+            },
+            "light" => Self {
+                user_fg: Color::DarkGray,
+                assistant_fg: Color::Black,
+                system_fg: Color::Blue,
+                error_fg: Color::Red,
+                border_fg: Color::DarkGray,
+                header_fg: Color::Blue,
+                status_fg: Color::DarkGray,
+            },
+            _ => Self::default(),
+        }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            user_fg: Color::Green,
+            assistant_fg: Color::White,
+            system_fg: Color::Yellow,
+            error_fg: Color::Red,
+            border_fg: Color::Reset,
+            header_fg: Color::Cyan,
+            status_fg: Color::Gray,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -78,6 +130,8 @@ impl Default for App {
             should_quit: false,
             status: "Disconnected".to_string(),
             scroll_offset: 0,
+            show_timestamps: false,
+            theme: Theme::default(),
         }
     }
 }
@@ -101,9 +155,7 @@ impl App {
             content,
         });
 
-        if self.output.len() > 0 {
-            self.scroll_offset = self.output.len().saturating_sub(1);
-        }
+        self.scroll_offset = self.output.len().saturating_sub(1);
     }
 
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Option<AppAction> {
@@ -335,8 +387,7 @@ fn run_event_loop(
         if event::poll(Duration::from_millis(100))? {
             while event::poll(Duration::from_millis(0))? {
                 if let Event::Key(key) = event::read()? {
-                    if let Some(_action) = app.handle_key(key.code, key.modifiers) {
-                    }
+                    let _ = app.handle_key(key.code, key.modifiers);
                 }
             }
         }
@@ -390,7 +441,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     ];
 
     let header = Line::from(vec![
-        Span::styled("Polyglot-AI ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("Polyglot-AI ", Style::default().fg(app.theme.header_fg).add_modifier(Modifier::BOLD)),
         Span::raw("| "),
         Span::raw(tabs.join(" ")),
     ]);
@@ -401,16 +452,24 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_chat_view(f: &mut Frame, area: Rect, app: &App) {
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let total = app.output.len();
+    let start = if total > visible_height {
+        app.scroll_offset.min(total.saturating_sub(visible_height))
+    } else {
+        0
+    };
+
     let items: Vec<ListItem> = app.output
         .iter()
-        .skip(app.scroll_offset.saturating_sub(area.height as usize))
-        .take(area.height as usize)
+        .skip(start)
+        .take(visible_height)
         .map(|line| {
             let style = match line.line_type {
-                OutputType::User => Style::default().fg(Color::Green),
-                OutputType::Assistant => Style::default().fg(Color::White),
-                OutputType::System => Style::default().fg(Color::Yellow),
-                OutputType::Error => Style::default().fg(Color::Red),
+                OutputType::User => Style::default().fg(app.theme.user_fg),
+                OutputType::Assistant => Style::default().fg(app.theme.assistant_fg),
+                OutputType::System => Style::default().fg(app.theme.system_fg),
+                OutputType::Error => Style::default().fg(app.theme.error_fg),
             };
 
             let prefix = match line.line_type {
@@ -420,10 +479,15 @@ fn draw_chat_view(f: &mut Frame, area: Rect, app: &App) {
                 OutputType::Error => "! ",
             };
 
-            ListItem::new(Line::from(vec![
-                Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
-                Span::styled(&line.content, style),
-            ]))
+            let mut spans = Vec::new();
+            if app.show_timestamps {
+                let ts = line.timestamp.format("[%H:%M] ").to_string();
+                spans.push(Span::styled(ts, Style::default().fg(app.theme.status_fg)));
+            }
+            spans.push(Span::styled(prefix, style.add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(&line.content, style));
+
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -611,11 +675,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 
     let input = Paragraph::new(app.input.as_str())
         .block(Block::default().borders(Borders::ALL).title("Input"))
-        .scroll((0, scroll_offset as u16));
+        .scroll((0, scroll_offset.min(u16::MAX as usize) as u16));
     f.render_widget(input, area);
 
     f.set_cursor_position((
-        area.x + visible_cursor_pos as u16 + 1,
+        area.x.saturating_add(visible_cursor_pos.min(u16::MAX as usize) as u16).saturating_add(1),
         area.y + 1,
     ));
 }

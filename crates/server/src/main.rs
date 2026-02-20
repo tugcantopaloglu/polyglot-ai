@@ -128,14 +128,56 @@ struct ServerState {
     config: ServerConfig,
     session_manager: SessionManager,
     user_manager: UserManager,
-    #[allow(dead_code)]
     invite_manager: auth::InviteManager,
     tool_manager: ToolManager,
     sync_manager: SyncManager,
-    #[allow(dead_code)]
     usage_tracker: UsageTracker,
+    health_checker: polyglot_common::HealthChecker,
+    metrics: polyglot_common::MetricsCollector,
+    quota_tracker: polyglot_common::QuotaTracker,
+    api_key_manager: polyglot_common::ApiKeyManager,
     session_env: RwLock<HashMap<Uuid, Vec<(String, String)>>>,
+    start_time: std::time::Instant,
     shutdown: AtomicBool,
+}
+
+impl ServerState {
+    /// Fire webhook notifications for an event
+    fn fire_webhook(&self, event: polyglot_common::WebhookEvent, data: serde_json::Value) {
+        let webhooks: Vec<_> = self.config.webhooks.iter()
+            .filter(|w| w.events.contains(&event))
+            .cloned()
+            .collect();
+
+        if webhooks.is_empty() {
+            return;
+        }
+
+        let payload = polyglot_common::WebhookPayload::new(event, data);
+
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            for webhook in webhooks {
+                let body = match serde_json::to_string(&payload) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+
+                let mut req = client.post(&webhook.url)
+                    .header("Content-Type", "application/json")
+                    .timeout(std::time::Duration::from_millis(webhook.timeout_ms));
+
+                if let Some(ref secret) = webhook.secret {
+                    let sig = polyglot_common::compute_webhook_signature(&body, secret);
+                    req = req.header("X-Webhook-Signature", sig);
+                }
+
+                if let Err(e) = req.body(body).send().await {
+                    debug!("Webhook delivery failed for {}: {}", webhook.url, e);
+                }
+            }
+        });
+    }
 }
 
 #[tokio::main]
@@ -225,6 +267,15 @@ async fn start_server(config: ServerConfig) -> Result<()> {
         println!();
     }
 
+    let health_checker = polyglot_common::HealthChecker::new(
+        polyglot_common::HealthCheckConfig::default()
+    );
+    let metrics = polyglot_common::MetricsCollector::new();
+    let quota_tracker = polyglot_common::QuotaTracker::new(
+        polyglot_common::QuotaConfig::default()
+    );
+    let api_key_manager = polyglot_common::ApiKeyManager::new(&config.auth.jwt_secret.clone().unwrap_or_default());
+
     let state = Arc::new(ServerState {
         config: config.clone(),
         session_manager,
@@ -233,9 +284,54 @@ async fn start_server(config: ServerConfig) -> Result<()> {
         tool_manager,
         sync_manager,
         usage_tracker,
+        health_checker,
+        metrics,
+        quota_tracker,
+        api_key_manager,
         session_env: RwLock::new(HashMap::new()),
+        start_time: std::time::Instant::now(),
         shutdown: AtomicBool::new(false),
     });
+
+    // Spawn optional Prometheus metrics endpoint
+    if let Some(metrics_port) = config.server.metrics_port {
+        let metrics_state = state.clone();
+        tokio::spawn(async move {
+            use tokio::net::TcpListener;
+            use tokio::io::AsyncWriteExt;
+
+            let addr = format!("0.0.0.0:{}", metrics_port);
+            let listener = match TcpListener::bind(&addr).await {
+                Ok(l) => {
+                    info!("Prometheus metrics endpoint listening on {}", addr);
+                    l
+                }
+                Err(e) => {
+                    error!("Failed to bind metrics endpoint on {}: {}", addr, e);
+                    return;
+                }
+            };
+
+            let exporter = polyglot_common::PrometheusExporter::new("polyglot");
+
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    let cache_stats = polyglot_common::CacheStats {
+                        entries: 0, hits: 0, misses: 0, hit_rate: 0.0, memory_bytes: 0,
+                    };
+                    let metrics_data = metrics_state.metrics.get_metrics(cache_stats);
+                    let body = exporter.format(&metrics_data);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        });
+    }
 
     let server_config = configure_quic_server(&config)?;
 
@@ -497,6 +593,11 @@ async fn handle_message(
         ClientMessage::Prompt { tool, message, working_dir } => {
             let tool = tool.or(*current_tool).unwrap_or(state.config.tools.default_tool);
 
+            // Create trace context for this request
+            let trace_ctx = polyglot_common::TraceContext::new();
+            let tool_span_ctx = trace_ctx.child();
+            debug!("Request trace: {} tool_span: {}", trace_ctx.to_traceparent(), tool_span_ctx.to_traceparent());
+
             let session_env = session_id
                 .and_then(|sid| state.session_env.read().get(&sid).cloned())
                 .unwrap_or_default();
@@ -513,8 +614,11 @@ async fn handle_message(
             let tool_manager = state.tool_manager.clone();
             let response_tx_clone = response_tx.clone();
             let switch_delay = state.config.tools.switch_delay;
+            let state_ref = state.clone();
 
             tokio::spawn(async move {
+                let mut span = polyglot_common::Span::new("tool_execution", tool_span_ctx)
+                    .with_attribute("tool", tool.as_str());
                 let execute_handle = tokio::spawn({
                     let tool_manager = tool_manager.clone();
                     async move {
@@ -522,15 +626,34 @@ async fn handle_message(
                     }
                 });
 
+                let mut stream_buffer = polyglot_common::StreamBuffer::new(
+                    polyglot_common::StreamConfig::default()
+                );
+
                 while let Some(output) = tool_rx.recv().await {
                     match output {
                         ToolOutput::Stdout(line) => {
+                            // Send ToolResponse for backward compatibility
                             response_tx_clone.send(ServerMessage::ToolResponse {
                                 tool,
-                                content: line,
+                                content: line.clone(),
                                 done: false,
                                 tokens: None,
                             }).await.ok();
+
+                            // Also send via streaming
+                            stream_buffer.push(&line);
+                            stream_buffer.push("\n");
+                            if stream_buffer.should_flush() {
+                                for chunk in stream_buffer.flush() {
+                                    response_tx_clone.send(ServerMessage::StreamChunk {
+                                        tool,
+                                        content: chunk.content,
+                                        sequence: chunk.sequence,
+                                        is_final: false,
+                                    }).await.ok();
+                                }
+                            }
                         }
                         ToolOutput::Stderr(line) => {
                             response_tx_clone.send(ServerMessage::ToolOutput {
@@ -540,6 +663,19 @@ async fn handle_message(
                             }).await.ok();
                         }
                         ToolOutput::Done { tokens } => {
+                            state_ref.metrics.record_request(tool, true, 0);
+                            state_ref.health_checker.record_success(tool, 0);
+
+                            // Finalize stream
+                            for chunk in stream_buffer.finalize() {
+                                response_tx_clone.send(ServerMessage::StreamChunk {
+                                    tool,
+                                    content: chunk.content,
+                                    sequence: chunk.sequence,
+                                    is_final: chunk.is_final,
+                                }).await.ok();
+                            }
+
                             response_tx_clone.send(ServerMessage::ToolResponse {
                                 tool,
                                 content: String::new(),
@@ -548,12 +684,22 @@ async fn handle_message(
                             }).await.ok();
                         }
                         ToolOutput::Error(e) => {
+                            state_ref.metrics.record_request(tool, false, 0);
+                            state_ref.health_checker.record_failure(tool);
+                            state_ref.fire_webhook(
+                                polyglot_common::WebhookEvent::RequestFailed,
+                                serde_json::json!({"tool": tool.as_str(), "error": &e}),
+                            );
                             response_tx_clone.send(ServerMessage::Error {
                                 code: ErrorCode::ToolError,
                                 message: e,
                             }).await.ok();
                         }
                         ToolOutput::RateLimited => {
+                            state_ref.fire_webhook(
+                                polyglot_common::WebhookEvent::RateLimited,
+                                serde_json::json!({"tool": tool.as_str()}),
+                            );
                             if let Some(next_tool) = tool_manager.get_next_tool(tool).await {
                                 response_tx_clone.send(ServerMessage::ToolSwitchNotice {
                                     from: tool,
@@ -572,8 +718,14 @@ async fn handle_message(
                 }
 
                 if let Err(e) = execute_handle.await {
+                    span.set_status(polyglot_common::SpanStatus::Error);
                     error!("Tool execution task failed: {}", e);
+                } else {
+                    span.set_status(polyglot_common::SpanStatus::Ok);
                 }
+                span.end();
+                debug!("Span completed: {} duration_ms={}", span.name,
+                    span.end_time.map(|e| (e - span.start_time).num_milliseconds()).unwrap_or(0));
             });
         }
 
@@ -714,6 +866,93 @@ async fn handle_message(
                 update_available,
                 update_url: state.config.updates.client_download_url.clone(),
                 update_message: state.config.updates.update_message.clone(),
+            }).await.ok();
+        }
+
+        ClientMessage::HealthCheck => {
+            let tool_health = state.health_checker.get_status();
+            let server_healthy = tool_health.iter().any(|t| t.healthy);
+            let uptime = state.start_time.elapsed().as_secs();
+
+            response_tx.send(ServerMessage::HealthStatus {
+                tools: tool_health,
+                server_healthy,
+                uptime_seconds: uptime,
+            }).await.ok();
+        }
+
+        ClientMessage::QuotaCheck => {
+            let user_id = session_id
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "anonymous".to_string());
+            let status = state.quota_tracker.get_status(&user_id);
+
+            response_tx.send(ServerMessage::QuotaInfo {
+                daily_limit: status.daily_limit,
+                daily_used: status.daily_used,
+                monthly_limit: status.monthly_limit,
+                monthly_used: status.monthly_used,
+                reset_at: Some(status.daily_reset),
+            }).await.ok();
+        }
+
+        ClientMessage::GetMetrics => {
+            let server_metrics = state.metrics.get_metrics(polyglot_common::CacheStats {
+                entries: 0,
+                hits: 0,
+                misses: 0,
+                hit_rate: 0.0,
+                memory_bytes: 0,
+            });
+
+            response_tx.send(ServerMessage::Metrics {
+                active_connections: server_metrics.active_connections,
+                total_requests: server_metrics.total_requests,
+                requests_per_minute: server_metrics.requests_per_minute,
+                tool_stats: server_metrics.tool_stats,
+                cache_stats: server_metrics.cache_stats,
+                uptime_seconds: server_metrics.uptime_seconds,
+            }).await.ok();
+        }
+
+        ClientMessage::ExportHistory { session_id: req_session_id, format } => {
+            let sid = req_session_id
+                .or_else(|| session_id.map(|s| s.to_string()))
+                .unwrap_or_default();
+
+            let data = match format {
+                polyglot_common::ExportFormat::Json => {
+                    format!("{{\"session_id\": \"{}\", \"exported\": true}}", sid)
+                }
+                polyglot_common::ExportFormat::Markdown => {
+                    format!("# Session Export\n\nSession: {}\n", sid)
+                }
+                polyglot_common::ExportFormat::Html => {
+                    format!("<html><body><h1>Session {}</h1></body></html>", sid)
+                }
+            };
+
+            response_tx.send(ServerMessage::HistoryExport {
+                format,
+                data,
+                session_count: 1,
+            }).await.ok();
+        }
+
+        ClientMessage::Cancel => {
+            state.tool_manager.cancel_all().await;
+            response_tx.send(ServerMessage::ToolResponse {
+                tool: current_tool.unwrap_or(Tool::Claude),
+                content: String::new(),
+                done: true,
+                tokens: None,
+            }).await.ok();
+        }
+
+        ClientMessage::RefreshToken { .. } => {
+            response_tx.send(ServerMessage::Error {
+                code: ErrorCode::AuthFailed,
+                message: "Server uses session-based auth, not token refresh".to_string(),
             }).await.ok();
         }
 
@@ -1015,57 +1254,16 @@ fn show_server_info(config: &ServerConfig) -> Result<()> {
     Ok(())
 }
 
-/// Check GitHub releases for available updates
+/// Check GitHub releases for available updates (used by VersionCheck handler)
 async fn check_for_updates(settings: &config::UpdateSettings) -> bool {
     if !settings.check_updates {
         return false;
     }
 
-    let client = match reqwest::Client::builder()
-        .user_agent("polyglot-server")
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    match client.get(&settings.update_check_url).send().await {
-        Ok(response) => {
-            if let Ok(json) = response.json::<serde_json::Value>().await {
-                if let Some(tag_name) = json.get("tag_name").and_then(|t| t.as_str()) {
-                    let remote_version = tag_name.trim_start_matches('v');
-                    let current_version = env!("CARGO_PKG_VERSION");
-                    return version_compare(remote_version, current_version) == std::cmp::Ordering::Greater;
-                }
-            }
-        }
-        Err(_) => {}
+    match polyglot_common::check_for_updates_github("polyglot-server").await {
+        Ok(info) => info.update_available,
+        Err(_) => false,
     }
-
-    false
-}
-
-/// Simple semantic version comparison
-fn version_compare(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
-
-    let a_parts = parse(a);
-    let b_parts = parse(b);
-
-    for i in 0..3 {
-        let a_val = a_parts.get(i).copied().unwrap_or(0);
-        let b_val = b_parts.get(i).copied().unwrap_or(0);
-        match a_val.cmp(&b_val) {
-            std::cmp::Ordering::Equal => continue,
-            other => return other,
-        }
-    }
-    std::cmp::Ordering::Equal
 }
 
 // ============================================================================
@@ -1084,10 +1282,10 @@ async fn run_update(check_only: bool, force: bool) -> Result<()> {
     println!("  Checking for updates...");
     println!();
 
-    let update_info = check_for_updates_github("polyglot-server").await?;
+    let update_info = polyglot_common::check_for_updates_github("polyglot-server").await?;
 
     if update_info.update_available || force {
-        println!("\x1b[32m  ✓ New version available: v{}\x1b[0m", update_info.latest_version);
+        println!("\x1b[32m  New version available: v{}\x1b[0m", update_info.latest_version);
         println!();
         if let Some(notes) = &update_info.release_notes {
             println!("  Release notes:");
@@ -1114,175 +1312,14 @@ async fn run_update(check_only: bool, force: bool) -> Result<()> {
 
         if input.trim().to_lowercase() == "y" {
             println!();
-            perform_update(&update_info).await?;
+            polyglot_common::perform_update(&update_info).await?;
         } else {
             println!("  Update cancelled.");
         }
     } else {
-        println!("\x1b[32m  ✓ You are running the latest version!\x1b[0m");
+        println!("\x1b[32m  You are running the latest version!\x1b[0m");
     }
 
     println!();
-    Ok(())
-}
-
-async fn check_for_updates_github(binary_name: &str) -> Result<polyglot_common::updater::UpdateInfo> {
-    use polyglot_common::updater::*;
-
-    let client = reqwest::Client::builder()
-        .user_agent("polyglot-server")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    let url = "https://api.github.com/repos/tugcantopaloglu/polyglot-ai/releases/latest";
-
-    let response = client.get(url).send().await?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("GitHub API returned status: {}", response.status());
-    }
-
-    let release: GitHubRelease = response.json().await?;
-    let current_version = env!("CARGO_PKG_VERSION");
-    let latest_version = release.tag_name.trim_start_matches('v').to_string();
-
-    let update_available = version_compare(&latest_version, current_version) == std::cmp::Ordering::Greater;
-
-    let asset_name = get_platform_asset_name(binary_name);
-    let (download_url, found_asset) = release.assets.iter()
-        .find(|a| a.name == asset_name || a.name.contains(&asset_name.replace(".exe", "")))
-        .map(|a| (Some(a.browser_download_url.clone()), Some(a.name.clone())))
-        .unwrap_or((None, None));
-
-    Ok(UpdateInfo {
-        current_version: current_version.to_string(),
-        latest_version,
-        update_available,
-        release_notes: release.body,
-        download_url,
-        asset_name: found_asset,
-    })
-}
-
-async fn perform_update(update_info: &polyglot_common::updater::UpdateInfo) -> Result<()> {
-    use polyglot_common::updater::*;
-
-    let download_url = update_info.download_url.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("No download URL available for your platform"))?;
-
-    let current_exe = get_current_exe()?;
-    let current_version = env!("CARGO_PKG_VERSION");
-
-    // Phase 1: Create backup
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Backing,
-        message: "Creating backup...".to_string(),
-        progress: None,
-    });
-
-    let backup_info = create_backup(&current_exe, current_version)?;
-    println!("    Backup created: {}", backup_info.backup_path.display());
-
-    // Phase 2: Download new version
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Downloading,
-        message: format!("Downloading v{}...", update_info.latest_version),
-        progress: Some(0),
-    });
-
-    let client = reqwest::Client::builder()
-        .user_agent("polyglot-server")
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
-
-    let response = client.get(download_url).send().await?;
-
-    if !response.status().is_success() {
-        restore_backup(&backup_info)?;
-        anyhow::bail!("Failed to download update: {}", response.status());
-    }
-
-    let new_binary = response.bytes().await?;
-    println!();
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Downloading,
-        message: format!("Downloaded {}", format_bytes(new_binary.len() as u64)),
-        progress: Some(100),
-    });
-
-    // Phase 3: Install new version
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Installing,
-        message: "Installing update...".to_string(),
-        progress: None,
-    });
-
-    #[cfg(windows)]
-    let new_exe_path = current_exe.with_extension("exe.new");
-    #[cfg(not(windows))]
-    let new_exe_path = current_exe.with_extension("new");
-
-    if let Err(e) = std::fs::write(&new_exe_path, &new_binary) {
-        restore_backup(&backup_info)?;
-        anyhow::bail!("Failed to write new binary: {}", e);
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&new_exe_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&new_exe_path, perms)?;
-    }
-
-    // Phase 4: Verify new binary
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Verifying,
-        message: "Verifying new binary...".to_string(),
-        progress: None,
-    });
-
-    if !verify_binary(&new_exe_path) {
-        let _ = std::fs::remove_file(&new_exe_path);
-        restore_backup(&backup_info)?;
-        anyhow::bail!("Downloaded binary failed verification");
-    }
-
-    // Replace the current executable
-    #[cfg(windows)]
-    {
-        let old_exe = current_exe.with_extension("exe.old");
-        if old_exe.exists() {
-            let _ = std::fs::remove_file(&old_exe);
-        }
-        std::fs::rename(&current_exe, &old_exe)?;
-        std::fs::rename(&new_exe_path, &current_exe)?;
-        let _ = std::fs::remove_file(&old_exe);
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(&new_exe_path, &current_exe)?;
-    }
-
-    // Phase 5: Cleanup
-    let _ = cleanup_old_backups(3);
-
-    print_status(&UpdateStatus {
-        phase: UpdatePhase::Complete,
-        message: format!("Successfully updated to v{}!", update_info.latest_version),
-        progress: None,
-    });
-
-    println!();
-    println!("\x1b[32m  ╔══════════════════════════════════════════════════════════════════╗\x1b[0m");
-    println!("\x1b[32m  ║                     UPDATE SUCCESSFUL!                           ║\x1b[0m");
-    println!("\x1b[32m  ╠══════════════════════════════════════════════════════════════════╣\x1b[0m");
-    println!("\x1b[32m  ║  Updated from v{:<10} to v{:<10}                       ║\x1b[0m",
-             current_version, update_info.latest_version);
-    println!("\x1b[32m  ║                                                                  ║\x1b[0m");
-    println!("\x1b[32m  ║  Please restart the server to use the new version.              ║\x1b[0m");
-    println!("\x1b[32m  ╚══════════════════════════════════════════════════════════════════╝\x1b[0m");
-    println!();
-
     Ok(())
 }

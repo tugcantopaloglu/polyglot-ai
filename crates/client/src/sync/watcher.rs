@@ -114,12 +114,23 @@ fn event_to_changes(event: Event) -> Vec<FileChange> {
                 changes.push(FileChange::Deleted(path));
             }
         }
-        _ => {
+        EventKind::Other => {
+            // Rename events on some platforms come as Other with 2 paths
             if event.paths.len() >= 2 {
                 changes.push(FileChange::Renamed {
                     from: event.paths[0].clone(),
                     to: event.paths[1].clone(),
                 });
+            } else {
+                for path in event.paths {
+                    changes.push(FileChange::Modified(path));
+                }
+            }
+        }
+        _ => {
+            // Access, Any, or unknown events - treat as modifications if paths exist
+            for path in event.paths {
+                changes.push(FileChange::Modified(path));
             }
         }
     }

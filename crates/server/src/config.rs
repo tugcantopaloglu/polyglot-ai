@@ -1,7 +1,5 @@
 //! Server configuration
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use polyglot_common::{AuthMode, RotationStrategy, Tool};
@@ -15,6 +13,8 @@ pub struct ServerConfig {
     pub storage: StorageSettings,
     #[serde(default)]
     pub updates: UpdateSettings,
+    #[serde(default)]
+    pub webhooks: Vec<polyglot_common::WebhookConfig>,
 }
 
 impl Default for ServerConfig {
@@ -25,6 +25,7 @@ impl Default for ServerConfig {
             tools: ToolsSettings::default(),
             storage: StorageSettings::default(),
             updates: UpdateSettings::default(),
+            webhooks: Vec::new(),
         }
     }
 }
@@ -61,6 +62,8 @@ pub struct ServerSettings {
     pub max_connections: u32,
     pub idle_timeout: u64,
     pub verbose: bool,
+    #[serde(default)]
+    pub metrics_port: Option<u16>,
 }
 
 impl Default for ServerSettings {
@@ -70,6 +73,7 @@ impl Default for ServerSettings {
             max_connections: 100,
             idle_timeout: 300,
             verbose: false,
+            metrics_port: None,
         }
     }
 }

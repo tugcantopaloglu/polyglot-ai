@@ -12,6 +12,34 @@ pub struct UserManager {
     conn: Mutex<Connection>,
 }
 
+/// Parse a user row from the database, handling invalid data gracefully instead of panicking.
+fn parse_user_row(row: &rusqlite::Row) -> rusqlite::Result<User> {
+    let id_str: String = row.get(0)?;
+    let id = Uuid::parse_str(&id_str)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+            0, rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UUID: {}", e)))
+        ))?;
+
+    let created_str: String = row.get(2)?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_str)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+            2, rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid timestamp: {}", e)))
+        ))?
+        .with_timezone(&Utc);
+
+    Ok(User {
+        id,
+        username: row.get(1)?,
+        created_at,
+        last_login: row.get::<_, Option<String>>(3)?
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc)),
+        is_admin: row.get::<_, i32>(4)? != 0,
+    })
+}
+
 impl UserManager {
     pub fn new(db_path: &Path) -> Result<Self, AuthError> {
         if let Some(parent) = db_path.parent() {
@@ -71,17 +99,7 @@ impl UserManager {
         )?;
 
         let user = stmt.query_row([id.to_string()], |row| {
-            Ok(User {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
-                username: row.get(1)?,
-                created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
-                    .unwrap()
-                    .with_timezone(&Utc),
-                last_login: row.get::<_, Option<String>>(3)?
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                is_admin: row.get::<_, i32>(4)? != 0,
-            })
+            parse_user_row(row)
         }).map_err(|_| AuthError::UserNotFound)?;
 
         Ok(user)
@@ -94,17 +112,7 @@ impl UserManager {
         )?;
 
         let user = stmt.query_row([username], |row| {
-            Ok(User {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
-                username: row.get(1)?,
-                created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
-                    .unwrap()
-                    .with_timezone(&Utc),
-                last_login: row.get::<_, Option<String>>(3)?
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                is_admin: row.get::<_, i32>(4)? != 0,
-            })
+            parse_user_row(row)
         }).map_err(|_| AuthError::UserNotFound)?;
 
         Ok(user)
@@ -117,17 +125,7 @@ impl UserManager {
         )?;
 
         let user = stmt.query_row([fingerprint], |row| {
-            Ok(User {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
-                username: row.get(1)?,
-                created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
-                    .unwrap()
-                    .with_timezone(&Utc),
-                last_login: row.get::<_, Option<String>>(3)?
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                is_admin: row.get::<_, i32>(4)? != 0,
-            })
+            parse_user_row(row)
         }).map_err(|_| AuthError::UserNotFound)?;
 
         Ok(user)
@@ -183,17 +181,7 @@ impl UserManager {
         )?;
 
         let users = stmt.query_map([], |row| {
-            Ok(User {
-                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
-                username: row.get(1)?,
-                created_at: chrono::DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
-                    .unwrap()
-                    .with_timezone(&Utc),
-                last_login: row.get::<_, Option<String>>(3)?
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&Utc)),
-                is_admin: row.get::<_, i32>(4)? != 0,
-            })
+            parse_user_row(row)
         })?.collect::<Result<Vec<_>, _>>()?;
 
         Ok(users)

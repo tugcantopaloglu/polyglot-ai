@@ -1671,7 +1671,12 @@ impl TraceContext {
         }
 
         let trace_id = TraceId::from_hex(parts[1])?;
-        let span_id = SpanId(parts[2].to_string());
+        // Validate span_id is a 16-char hex string
+        let span_str = parts[2];
+        if span_str.len() != 16 || !span_str.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let span_id = SpanId(span_str.to_string());
         let sampled = parts[3] == "01";
 
         Some(Self {

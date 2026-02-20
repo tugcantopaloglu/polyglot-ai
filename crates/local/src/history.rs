@@ -57,9 +57,7 @@ impl HistoryManager {
         }
 
         let session = ChatSession::new(self.current_project.clone());
-        self.current_session = Some(session);
-        // Safe: we just assigned Some above
-        self.current_session.as_mut().expect("session was just created")
+        self.current_session.insert(session)
     }
 
     pub fn current_session(&mut self) -> &mut ChatSession {
@@ -67,8 +65,8 @@ impl HistoryManager {
             let session = ChatSession::new(self.current_project.clone());
             self.current_session = Some(session);
         }
-        // Safe: we ensure Some exists above
-        self.current_session.as_mut().expect("session must exist after init check")
+        // SAFETY: guaranteed Some by the check above
+        self.current_session.as_mut().expect("session must exist")
     }
 
     pub fn has_session(&self) -> bool {

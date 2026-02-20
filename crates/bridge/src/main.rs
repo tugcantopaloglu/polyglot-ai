@@ -16,7 +16,7 @@ use parking_lot::RwLock;
 use quinn::{ClientConfig as QuinnClientConfig, Endpoint};
 use rcgen::{CertificateParams, DnType, SanType};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio_rustls::TlsAcceptor;
@@ -34,6 +34,7 @@ use polyglot_common::{
     HealthChecker, HealthCheckConfig,
     MetricsCollector,
     ContextWindowManager, ContextWindowConfig,
+    LoadBalancer, LoadBalanceStrategy, ToolInstance,
     Database, AuditLogEntry, StoredSession,
 };
 
@@ -185,6 +186,7 @@ struct BridgeState {
     metrics: MetricsCollector,
     response_cache: ResponseCache<String, String>,
     context_manager: ContextWindowManager,
+    load_balancer: LoadBalancer,
     config: BridgeConfig,
     token_sessions: RwLock<HashMap<String, TokenSession>>,
     database: Option<Database>,
@@ -220,6 +222,20 @@ impl BridgeState {
             None
         };
 
+        let load_balancer = LoadBalancer::new(LoadBalanceStrategy::LeastConnections);
+        // Register a default instance for each tool
+        for tool in Tool::all() {
+            load_balancer.register(ToolInstance {
+                id: format!("{}-default", tool.as_str()),
+                tool: *tool,
+                endpoint: "local".to_string(),
+                weight: 1,
+                healthy: true,
+                active_connections: 0,
+                avg_response_time_ms: 0,
+            });
+        }
+
         Arc::new(Self {
             rate_limiter: RateLimiter::new(RateLimitConfig {
                 max_requests: config.rate_limit,
@@ -240,6 +256,7 @@ impl BridgeState {
                 response_reserve: 4000,
                 estimation_method: polyglot_common::TokenEstimationMethod::CharDivide4,
             }),
+            load_balancer,
             token_sessions: RwLock::new(HashMap::new()),
             database,
             config,
@@ -252,6 +269,12 @@ impl BridgeState {
             return requested;
         }
 
+        // Try load balancer first - if the requested tool has healthy instances, use it
+        if let Some(_instance) = self.load_balancer.select(requested) {
+            return requested;
+        }
+
+        // Fallback to health checker
         self.health_checker
             .get_tool_with_fallback(requested, Tool::all())
             .unwrap_or(requested)
@@ -396,7 +419,7 @@ impl BridgeState {
     fn refresh_token(&self, old_token: &str) -> Option<TokenSession> {
         let mut sessions = self.token_sessions.write();
         if sessions.remove(old_token).is_some() {
-            let new_token = polyglot_common::crypto::generate_token();
+            let new_token = polyglot_common::crypto::random_token(32);
             let now = Utc::now();
             let session = TokenSession {
                 token: new_token.clone(),
@@ -642,7 +665,7 @@ async fn main() -> Result<()> {
 
         // Check connection rate limit
         let ip = addr.ip().to_string();
-        if let Err(msg) = state.check_connection_rate(&ip) {
+        if let Err(_msg) = state.check_connection_rate(&ip) {
             warn!("Connection rate limited for {}", ip);
             continue;
         }
@@ -669,19 +692,31 @@ async fn handle_socket(
 ) -> Result<()> {
     let token_required = config.token.clone();
 
-    let ws_stream = if let Some(acceptor) = tls_acceptor {
+    if let Some(acceptor) = tls_acceptor {
         let tls_stream = acceptor.accept(stream).await?;
-        accept_ws(tls_stream, token_required).await?
+        let ws_stream = accept_ws(tls_stream, token_required).await?;
+        run_ws_connection(ws_stream, addr, &config, started, state).await
     } else {
-        accept_ws(stream, token_required).await?
-    };
+        let ws_stream = accept_ws(stream, token_required).await?;
+        run_ws_connection(ws_stream, addr, &config, started, state).await
+    }
+}
 
+async fn run_ws_connection<S>(
+    ws_stream: WsStream<S>,
+    addr: SocketAddr,
+    config: &BridgeConfig,
+    started: Instant,
+    state: Arc<BridgeState>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     info!("WebSocket client connected: {}", addr);
     let result = match config.mode {
-        BridgeMode::Server => handle_server_bridge(ws_stream, &config, started, state.clone()).await,
-        BridgeMode::Local => handle_local_bridge(ws_stream, &config, started, state.clone(), &addr.ip().to_string()).await,
+        BridgeMode::Server => handle_server_bridge(ws_stream, config, started, state.clone()).await,
+        BridgeMode::Local => handle_local_bridge(ws_stream, config, started, state.clone(), &addr.ip().to_string()).await,
     };
-
     info!("WebSocket client disconnected: {}", addr);
     result
 }
@@ -906,14 +941,23 @@ where
                     .filter(|(key, value)| {
                         // Reject keys with dangerous characters or patterns
                         !key.is_empty() &&
+                        key.len() <= 256 &&
                         key.chars().all(|c| c.is_alphanumeric() || c == '_') &&
                         !key.starts_with("LD_") &&
                         !key.starts_with("DYLD_") &&
                         key != "PATH" &&
+                        key != "HOME" &&
+                        key != "SHELL" &&
                         // Reject values with shell injection characters
+                        value.len() <= 8192 &&
                         !value.contains('\0') &&
                         !value.contains('`') &&
-                        !value.contains("$(")
+                        !value.contains("$(") &&
+                        !value.contains('|') &&
+                        !value.contains(';') &&
+                        !value.contains('&') &&
+                        !value.contains('\n') &&
+                        !value.contains('\r')
                     })
                     .collect();
                 let response = ServerMessage::EnvAck {
@@ -1193,19 +1237,38 @@ where
 
     let mut stdout_done = false;
     let mut stderr_done = false;
+    let mut stream_buffer = polyglot_common::StreamBuffer::new(
+        polyglot_common::StreamConfig::default()
+    );
 
     while !(stdout_done && stderr_done) {
         tokio::select! {
             line = stdout_lines.next_line(), if !stdout_done => {
                 match line? {
                     Some(text) => {
+                        // Send ToolResponse for backward compatibility
                         let msg = ServerMessage::ToolResponse {
                             tool,
-                            content: text,
+                            content: text.clone(),
                             done: false,
                             tokens: None,
                         };
                         send_ws_message(ws_write, codec, &msg).await?;
+
+                        // Also send via streaming
+                        stream_buffer.push(&text);
+                        stream_buffer.push("\n");
+                        if stream_buffer.should_flush() {
+                            for chunk in stream_buffer.flush() {
+                                let chunk_msg = ServerMessage::StreamChunk {
+                                    tool,
+                                    content: chunk.content,
+                                    sequence: chunk.sequence,
+                                    is_final: false,
+                                };
+                                send_ws_message(ws_write, codec, &chunk_msg).await?;
+                            }
+                        }
                     }
                     None => stdout_done = true,
                 }
@@ -1233,6 +1296,17 @@ where
             message: format!("polyglot-local exited with {}", status),
         };
         send_ws_message(ws_write, codec, &msg).await?;
+    }
+
+    // Finalize stream
+    for chunk in stream_buffer.finalize() {
+        let chunk_msg = ServerMessage::StreamChunk {
+            tool,
+            content: chunk.content,
+            sequence: chunk.sequence,
+            is_final: chunk.is_final,
+        };
+        send_ws_message(ws_write, codec, &chunk_msg).await?;
     }
 
     let done = ServerMessage::ToolResponse {
@@ -1829,20 +1903,21 @@ fn ensure_tls_files(config: &BridgeConfig) -> Result<()> {
 
     let mut params = CertificateParams::default();
     params.distinguished_name.push(DnType::CommonName, "polyglot-bridge");
-    params.subject_alt_names.push(SanType::DnsName("localhost".to_string()));
+    params.subject_alt_names.push(SanType::DnsName("localhost".try_into()?));
     params.subject_alt_names.push(SanType::IpAddress(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
 
     if let Some(host) = config.qr_host.as_ref() {
         if let Ok(ip) = host.parse::<IpAddr>() {
             params.subject_alt_names.push(SanType::IpAddress(ip));
         } else {
-            params.subject_alt_names.push(SanType::DnsName(host.clone()));
+            params.subject_alt_names.push(SanType::DnsName(host.as_str().try_into()?));
         }
     }
 
-    let cert = rcgen::Certificate::from_params(params)?;
-    std::fs::write(&config.tls_cert, cert.serialize_pem()?)?;
-    std::fs::write(&config.tls_key, cert.serialize_private_key_pem())?;
+    let key_pair = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+    std::fs::write(&config.tls_cert, cert.pem())?;
+    std::fs::write(&config.tls_key, key_pair.serialize_pem())?;
 
     Ok(())
 }

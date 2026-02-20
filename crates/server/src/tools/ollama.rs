@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use parking_lot::Mutex;
 use polyglot_common::Tool;
-use super::{ToolAdapter, ToolError, ToolOutput, ToolRequest};
+use super::{ToolAdapter, ToolError, ToolOutput, ToolRequest, is_rate_limit_message};
 
 pub struct OllamaAdapter {
     path: String,
@@ -151,18 +151,31 @@ impl ToolAdapter for OllamaAdapter {
         let stderr_handle = tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
+            let mut rate_limited = false;
 
             while let Ok(Some(line)) = lines.next_line().await {
-                let _ = output_tx_stderr.send(ToolOutput::Stderr(line)).await;
+                if is_rate_limit_message(&line) {
+                    rate_limited = true;
+                    let _ = output_tx_stderr.send(ToolOutput::RateLimited).await;
+                } else {
+                    let _ = output_tx_stderr.send(ToolOutput::Stderr(line)).await;
+                }
             }
+
+            rate_limited
         });
 
         let status = child.wait().await?;
 
         let _ = stdout_handle.await;
-        let _ = stderr_handle.await;
+        let rate_limited = stderr_handle.await.unwrap_or(false);
 
         *self.current_process.lock() = None;
+
+        if rate_limited {
+            output_tx.send(ToolOutput::RateLimited).await.ok();
+            return Err(ToolError::RateLimited);
+        }
 
         if status.success() {
             output_tx.send(ToolOutput::Done { tokens: None }).await.ok();
