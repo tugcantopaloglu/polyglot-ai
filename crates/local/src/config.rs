@@ -159,6 +159,7 @@ fn default_network_policy() -> String {
 
 fn default_env_whitelist() -> HashSet<String> {
     let mut set = HashSet::new();
+    // Unix essentials
     set.insert("PATH".to_string());
     set.insert("HOME".to_string());
     set.insert("USER".to_string());
@@ -166,6 +167,25 @@ fn default_env_whitelist() -> HashSet<String> {
     set.insert("LC_ALL".to_string());
     set.insert("TERM".to_string());
     set.insert("PWD".to_string());
+    // Windows essentials (processes crash without these)
+    set.insert("SystemRoot".to_string());
+    set.insert("SYSTEMROOT".to_string());
+    set.insert("APPDATA".to_string());
+    set.insert("LOCALAPPDATA".to_string());
+    set.insert("USERPROFILE".to_string());
+    set.insert("PROGRAMDATA".to_string());
+    set.insert("PROGRAMFILES".to_string());
+    set.insert("COMMONPROGRAMFILES".to_string());
+    set.insert("COMSPEC".to_string());
+    set.insert("WINDIR".to_string());
+    set.insert("TEMP".to_string());
+    set.insert("TMP".to_string());
+    set.insert("USERNAME".to_string());
+    set.insert("HOMEDRIVE".to_string());
+    set.insert("HOMEPATH".to_string());
+    set.insert("OS".to_string());
+    set.insert("NUMBER_OF_PROCESSORS".to_string());
+    set.insert("PROCESSOR_ARCHITECTURE".to_string());
     set
 }
 

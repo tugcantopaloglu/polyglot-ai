@@ -158,13 +158,27 @@ impl SandboxConfig {
 
     pub fn filter_env_vars(&self, env: &[(String, String)]) -> Vec<(String, String)> {
         if !self.enabled {
-            return env.to_vec();
+            // When sandbox is disabled, inherit whitelisted system vars + tool config vars
+            let mut result: Vec<(String, String)> = std::env::vars().collect();
+            for (key, value) in env {
+                result.push((key.clone(), value.clone()));
+            }
+            return result;
         }
 
-        env.iter()
+        // Start with whitelisted vars from the current process environment
+        let mut result: Vec<(String, String)> = std::env::vars()
             .filter(|(key, _)| self.env_whitelist.contains(key))
-            .cloned()
-            .collect()
+            .collect();
+
+        // Add whitelisted vars from tool-specific config
+        for (key, value) in env {
+            if self.env_whitelist.contains(key) {
+                result.push((key.clone(), value.clone()));
+            }
+        }
+
+        result
     }
 
     pub fn add_tool_env_vars(&self, env: &mut Vec<(String, String)>, tool: Tool) {
