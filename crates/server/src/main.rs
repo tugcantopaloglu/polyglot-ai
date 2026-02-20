@@ -274,7 +274,7 @@ async fn start_server(config: ServerConfig) -> Result<()> {
     let quota_tracker = polyglot_common::QuotaTracker::new(
         polyglot_common::QuotaConfig::default()
     );
-    let api_key_manager = polyglot_common::ApiKeyManager::new(&jwt_secret);
+    let api_key_manager = polyglot_common::ApiKeyManager::new(&config.auth.jwt_secret.clone().unwrap_or_default());
 
     let state = Arc::new(ServerState {
         config: config.clone(),
