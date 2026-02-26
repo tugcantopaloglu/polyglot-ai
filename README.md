@@ -5,7 +5,7 @@ Is developers done? or we are not coding anymore? Who cares. Vibe coding, hard c
 
 Btw it's written in rust because why not.
 
-Feel free to open issues and pull requests for more feautres. I will be checking them every saturday.
+Feel free to open issues and pull requests for more feautres. I will be checking them everyday.
 
 So shortly a self-hosted platform that aggregates multiple AI coding assistants into a single interface. Query Claude, Gemini, Codex, GitHub Copilot, Cursor, Perplexity, and Ollama through one unified CLI with automatic failover, rate limit handling, and context preservation across tools.
 
