@@ -1,3 +1,5 @@
+# This project is discontinued because antrophic has been implemented remote control and better context compaction. If anyone wants to implement and improve this repo you are free to use for anything. Best regards.  
+
 [![Release](https://github.com/tugcantopaloglu/polyglot-ai/actions/workflows/release.yml/badge.svg)](https://github.com/tugcantopaloglu/polyglot-ai/actions/workflows/release.yml)
  # Polyglot-AI - multiLLM "vibing" platform
 
